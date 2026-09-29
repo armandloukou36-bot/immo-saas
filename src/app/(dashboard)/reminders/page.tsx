@@ -11,7 +11,7 @@ const reminders = [
   { id: 'REM-2026-0007', type: 'general', client: 'M. Guessan Koffi', invoice: null, dueDate: '—', scheduled: '01 Mar 2026', sent: null, status: 'pending', channel: 'sms' },
 ];
 
-const typeLabels = {
+const typeLabels: Record<string, string> = {
   rent_reminder: 'Relance loyer',
   payment_reminder: 'Relance paiement',
   recovery_notice: 'Avis recouvrement',
