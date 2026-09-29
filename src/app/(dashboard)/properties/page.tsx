@@ -1,6 +1,8 @@
 'use client';
 
 import { useState } from 'react';
+import Link from 'next/link';
+import { TypeIcon } from '@/components/ui/TypeIcon';
 
 // Données démonstration
 const properties = [
@@ -15,34 +17,6 @@ const properties = [
 ];
 
 const statuses = ['disponible', 'loué', 'en_negociation', 'vendu', 'reserve'];
-
-const typeIcons: Record<string, JSX.Element> = {
-  villa: (
-    <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-      <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 15.75l5.159-5.159a2.25 2.25 0 013.182 0l5.159 5.159m-1.5-1.5l1.409-1.409a2.25 2.25 0 013.182 0l2.909 2.909M3.75 21h16.5A2.25 2.25 0 0022.5 18.75V5.25A2.25 2.25 0 0020.25 3H3.75A2.25 2.25 0 001.5 5.25v13.5A2.25 2.25 0 003.75 21z" />
-    </svg>
-  ),
-  appartement: (
-    <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-      <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 12c0 4.142-3.358 7.5-7.5 7.5a7.5 7.5 0 10-7.5-7.5H5.25m6.75-3.75h-3m3 3v-3m-6 6h12a2.25 2.25 0 002.25-2.25V6.75A2.25 2.25 0 0019.5 4.5h-15a2.25 2.25 0 00-2.25 2.25v10.5a2.25 2.25 0 002.25 2.25z" />
-    </svg>
-  ),
-  terrain: (
-    <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-      <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 3v11.25A2.25 2.25 0 006 16.5h2.25M3.75 3h-1.5m1.5 0h16.5m0 0h1.5m-1.5 0v12a2.25 2.25 0 01-2.25 2.25H5.25A2.25 2.25 0 013 16.5V3m0 0a2.25 2.25 0 012.25-2.25m0 0a2.25 2.25 0 012.25 2.25m0 0v12.75m0-12.75h16.5m-16.5 0H3" />
-    </svg>
-  ),
-  local: (
-    <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-      <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 21.75v-1.5a2.25 2.25 0 00-2.25-2.25h-3A2.25 2.25 0 0012 18.75v3m6.75-10.5a2.25 2.25 0 00-2.25-2.25H9.75A2.25 2.25 0 007.5 10.5h.75a2.25 2.25 0 012.25 2.25v.75m2.25 1.5a2.25 2.25 0 010 3h1.5a2.25 2.25 0 010-3m-10.5-3l1.5 1.5m0 0l2.25 2.25M12 10.5l1.5 1.5M16.5 8.25L15 6.75" />
-    </svg>
-  ),
-  bureau: (
-    <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-      <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 9h16.5M3.75 15h16.5M5.25 3h13.5A2.25 2.25 0 0121 5.25v13.5A2.25 2.25 0 0118.75 21H5.25A2.25 2.25 0 013 18.75V5.25A2.25 2.25 0 015.25 3z" />
-    </svg>
-  ),
-};
 
 export default function PropertiesPage() {
   const [search, setSearch] = useState('');

@@ -11,7 +11,7 @@ const leases = [
   { id: 'LE-2026-0006', property: 'Terrain Angré', client: 'M. AG | Investisseur', startDate: '01 Jan 2026', endDate: '—', rent: '—', deposit: '—', status: 'draft', remaining: '—' },
 ];
 
-const statusesMap = {
+const statusesMap: Record<string, { label: string; color: string }> = {
   active: { label: 'Actif', color: 'status-active' },
   terminated: { label: 'Terminé', color: 'status-pending' },
   expired: { label: 'Expiré', color: 'status-pending' },

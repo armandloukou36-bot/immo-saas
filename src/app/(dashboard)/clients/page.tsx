@@ -2,6 +2,7 @@
 
 import { useState } from 'react';
 import Link from 'next/link';
+import { TypeIcon } from '@/components/ui/TypeIcon';
 
 // Données démonstration
 const clients = [
@@ -26,27 +27,6 @@ export default function ClientsPage() {
     const matchesType = typeFilter === 'all' || c.type === typeFilter;
     return matchesSearch && matchesType;
   });
-
-  const TypeIcon = ({ type }: { type: string }) => {
-    const iconMap: Record<string, JSX.Element> = {
-      locataire: (
-        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-          <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 12l8.954-8.955a1.126 1.126 0 011.591 0L21.75 12M4.5 9.75v10.125c0 .621.504 1.125 1.125 1.125H9.75v-4.875c0-.621.504-1.125 1.125-1.125h2.25c.621 0 1.125.504 1.125 1.125V21h4.125c.621 0 1.125-.504 1.125-1.125V9.75M6.75 15h.008v.008H6.75V15zm0 0h.008v.008H6.75V15z" />
-        </svg>
-      ),
-      propriétaire: (
-        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-          <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 21h19.5M2.25 21V3m2.25 3l10.5 4.5L21 12v9M3.75 12l3-4.5M13.5 12L21 7.5" />
-        </svg>
-      ),
-      prospect: (
-        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-          <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 6a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0zM4.501 20.105a7.5 7.5 0 0114.998 0A17.933 17.933 0 0112 21.75c-2.678 0-5.216-.5-7.499-1.437m.979 1.953a7.5 7.5 0 0014.998 0 17.933 17.933 0 007.499-1.437m-.979-1.953a7.5 7.5 0 01-14.998 0 17.933 17.933 0 01-7.499-1.437" />
-        </svg>
-      ),
-    };
-    return iconMap[type] || <span className="w-4 h-4" />;
-  };
 
   return (
     <div className="space-y-6 animate-fade-in">
