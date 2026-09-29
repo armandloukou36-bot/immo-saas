@@ -9,7 +9,7 @@ const recoveryCases = [
   { id: 'REC-2025-0045', client: 'Mme Yéo Solange', invoice: 'INV-2025-0048', property: 'Villa Bingerville', amount: '2 100 000', opened: '05 Août 2025', status: 'closed', assigned: 'Manager', closed: '30 Sep 2025', notes: 'Accord de paiement échelonné. 3 mensualités de 700 000 FCFA. Dossier clôturé.' },
 ];
 
-const statusConfig = {
+const statusConfig: Record<string, { label: string; color: string; icon: string }> = {
   open: { label: 'Ouvert', color: 'status-pending', icon: '📋' },
   investigating: { label: 'Investigation', color: 'status-pending', icon: '🔍' },
   notice_sent: { label: 'Avis envoyé', color: 'status-active', icon: '📤' },
