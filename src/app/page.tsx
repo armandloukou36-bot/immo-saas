@@ -40,7 +40,7 @@ export default function HomePage() {
               Agence immobilière premium
             </div>
             <h1 className="text-5xl md:text-6xl lg:text-7xl font-bold text-white font-serif leading-tight">
-              SCONVERGE
+              SCONVEGE
               <span className="block text-gold-400 mt-2">IMMOBILIER</span>
             </h1>
             <p className="text-xl md:text-2xl text-navy-200 mt-6 max-w-3xl mx-auto font-light">
@@ -168,7 +168,7 @@ export default function HomePage() {
         <div className="max-w-7xl mx-auto px-4">
           <div className="flex flex-col md:flex-row items-center justify-between gap-4">
             <div className="text-navy-400 text-sm">
-              © 2026 SCONVERGE IMMOBILIER. Tous droits réservés.
+              © 2026 SCONVEGE IMMOBILIER. Tous droits réservés.
             </div>
             <div className="flex items-center gap-4 text-navy-500">
               <span className="text-xs">Construit avec ❤️ pour l'immobilier ivoirien</span>

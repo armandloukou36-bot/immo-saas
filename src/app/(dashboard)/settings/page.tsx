@@ -3,7 +3,7 @@
 import { useState } from 'react';
 
 const org = {
-  name: 'SCONVERGE IMMOBILIER',
+  name: 'SCONVEGE IMMOBILIER',
   slug: 'sconverge',
   plan: 'pro',
   status: 'active',

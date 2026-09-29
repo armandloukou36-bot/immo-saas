@@ -67,7 +67,7 @@ export default function RegisterPage() {
                 value={form.organizationName}
                 onChange={(e) => handleChange('organizationName', e.target.value)}
                 className="input-base"
-                placeholder="Ex: SCONVERGE IMMOBILIER"
+                placeholder="Ex: SCONVEGE IMMOBILIER"
                 required
               />
             </div>
