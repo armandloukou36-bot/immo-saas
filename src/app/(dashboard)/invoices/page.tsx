@@ -11,7 +11,7 @@ const invoices = [
   { id: 'INV-2025-0120', client: 'M. Guessan Koffi', property: 'Villa Monte-Carlo', lease: 'LE-2025-0050', amount: '500 000', dueDate: '15 Déc 2025', paidDate: '14 Déc 2025', status: 'paid', recurrence: 'un_times' },
 ];
 
-const statusConfig = {
+const statusConfig: Record<string, { label: string; color: string; icon: string }> = {
   pending: { label: 'En attente', color: 'status-pending', icon: '⏳' },
   paid: { label: 'Payée', color: 'status-paid', icon: '✓' },
   overdue: { label: 'En retard', color: 'status-overdue', icon: '⚠' },

@@ -46,7 +46,7 @@ export default function LeasesPage() {
           { label: 'Baux actifs', count: leases.filter(l => l.status === 'active').length, color: 'bg-green-500' },
           { label: 'En attente', count: leases.filter(l => l.status === 'pending').length, color: 'bg-amber-500' },
           { label: 'Terminés', count: leases.filter(l => l.status === 'terminated').length, color: 'bg-navy-400' },
-          { label: 'CA mensuel', count: leases.filter(l => l.status === 'active').reduce((s, l) => s + (parseInt(l.rent.replace(/\s/g, '') || 0), 0), 0).toLocaleString(), color: 'bg-gold-400' },
+          { label: 'CA mensuel', count: leases.filter(l => l.status === 'active').reduce((s, l) => s + Number(l.rent.replace(/\s/g, '') || 0), 0).toLocaleString(), color: 'bg-gold-400' },
         ].map(s => (
           <div key={s.label} className="bg-white rounded-lg border border-navy-100 p-3 flex items-center justify-between">
             <div className="text-xs text-navy-500">{s.label}</div>
