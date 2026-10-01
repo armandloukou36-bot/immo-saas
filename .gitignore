@@ -7,3 +7,14 @@ node_modules
 Thumbs.db
 
 .vercel
+
+# Artefacts de build TypeScript
+tsconfig.tsbuildinfo
+next-env.d.ts
+
+# Base de données locale (SQLite)
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm

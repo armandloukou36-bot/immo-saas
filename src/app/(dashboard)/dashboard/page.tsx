@@ -1,45 +1,105 @@
+import { redirect } from 'next/navigation';
+import { getSession } from '@/lib/auth';
+import { getDb } from '@/lib/db';
+import { formatFCFA, formatDate, timeAgo } from '@/lib/format';
+import { INVOICE_STATUS, StatusBadge, statusOf } from '@/components/ui/StatusBadge';
+import type { InvoiceWithRelations } from '@/lib/types';
 import Link from 'next/link';
 
-// Statistiques du dashboard (demo mode - données simulées)
-const stats = [
-  { label: 'Biens totaux', value: '24', change: '+3', positive: true, href: '/properties' },
-  { label: 'Locataires actifs', value: '47', change: '+5', positive: true, href: '/clients' },
-  { label: 'Baux actifs', value: '38', change: '+2', positive: true, href: '/leases' },
-  { label: 'Factures en attente', value: '12', change: '-4', positive: false, href: '/invoices' },
-  { label: 'Montant en attente', value: '4 200 000', change: '+850 000', positive: false, href: '/invoices' },
-  { label: 'Relances à faire', value: '8', change: '-2', positive: true, href: '/reminders' },
-  { label: 'Dossiers recouvrement', value: '3', change: '0', positive: null, href: '/recovery' },
-  { label: 'CA ce mois', value: '18 500 000', change: '+12%', positive: true, href: '/invoices' },
-];
-
-const recentInvoices = [
-  { id: 'INV-2026-0045', client: 'M. Kouassi Jean', property: 'Villa Cocody', amount: '2 500 000', due: '15 Mar 2026', status: 'pending' },
-  { id: 'INV-2026-0044', client: 'Mme Diallo Amina', property: 'Appart Les Palmiers', amount: '1 800 000', due: '10 Mar 2026', status: 'paid' },
-  { id: 'INV-2026-0043', client: 'M. Traoré Idriss', property: 'Villa Angré', amount: '3 200 000', due: '01 Mar 2026', status: 'overdue' },
-  { id: 'INV-2026-0042', client: 'Mme Koné Fatoumata', property: 'Appart Résidence du Lac', amount: '1 500 000', due: '28 Fév 2026', status: 'paid' },
-];
-
-const recentActivity = [
-  { action: 'Facture payée', detail: 'INV-2026-0044 — Mme Diallo Amina', time: 'Il y a 2h' },
-  { action: 'Nouveau bail créé', detail: 'Bail #LE-2026-0018 — M. Bamba Seydou', time: 'Il y a 4h' },
-  { action: 'Bien ajouté', detail: 'Villa Monte-Carlo — Cocody Angré', time: 'Il y a 6h' },
-  { action: 'Relance envoyée', detail: 'INV-2026-0043 — M. Traoré Idriss', time: 'Il y a 8h' },
-  { action: 'Paiement enregistré', detail: '1 500 000 FCFA — Mme Koné Fatoumata', time: 'Il y a 1 jour' },
-];
-
-const statusColors: Record<string, string> = {
-  pending: 'status-pending',
-  paid: 'status-paid',
-  overdue: 'status-overdue',
-  active: 'status-active',
-  available: 'status-available',
+type Stats = {
+  total_properties: number;
+  available_properties: number;
+  leased_properties: number;
+  total_clients: number;
+  active_leases: number;
+  pending_invoices: number;
+  overdue_invoices: number;
+  pending_amount: number;
+  overdue_amount: number;
+  open_recovery_cases: number;
+  recovery_amount: number;
+  paid_this_month: number;
+  revenue_this_month: number;
 };
 
+type Activity = { id: string; action: string; detail: string | null; created_at: string };
+
 export default function DashboardPage() {
+  const user = getSession();
+  if (!user) redirect('/login');
+  const orgId = user.org_id;
+  const db = getDb();
+
+  const stats = db
+    .prepare(
+      `SELECT
+        (SELECT COUNT(*) FROM properties WHERE org_id = ?) AS total_properties,
+        (SELECT COUNT(*) FROM properties WHERE org_id = ? AND status = 'disponible') AS available_properties,
+        (SELECT COUNT(*) FROM properties WHERE org_id = ? AND status = 'loué') AS leased_properties,
+        (SELECT COUNT(*) FROM clients WHERE org_id = ?) AS total_clients,
+        (SELECT COUNT(*) FROM leases WHERE org_id = ? AND status = 'active') AS active_leases,
+        (SELECT COUNT(*) FROM invoices WHERE org_id = ? AND status = 'pending') AS pending_invoices,
+        (SELECT COUNT(*) FROM invoices WHERE org_id = ? AND status = 'overdue') AS overdue_invoices,
+        (SELECT COALESCE(SUM(amount), 0) FROM invoices WHERE org_id = ? AND status = 'pending') AS pending_amount,
+        (SELECT COALESCE(SUM(amount), 0) FROM invoices WHERE org_id = ? AND status = 'overdue') AS overdue_amount,
+        (SELECT COUNT(*) FROM recovery_cases WHERE org_id = ? AND status IN ('open','investigating','notice_sent','legal_action')) AS open_recovery_cases,
+        (SELECT COALESCE(SUM(amount_due), 0) FROM recovery_cases WHERE org_id = ? AND status NOT IN ('resolved','closed','waived')) AS recovery_amount,
+        (SELECT COUNT(*) FROM invoices WHERE org_id = ? AND status = 'paid' AND substr(paid_date, 1, 7) = substr(date('now'), 1, 7)) AS paid_this_month,
+        (SELECT COALESCE(SUM(amount), 0) FROM invoices WHERE org_id = ? AND status = 'paid' AND substr(paid_date, 1, 7) = substr(date('now'), 1, 7)) AS revenue_this_month`
+    )
+    .get(orgId, orgId, orgId, orgId, orgId, orgId, orgId, orgId, orgId, orgId, orgId, orgId, orgId) as Stats;
+
+  const recentInvoices = db
+    .prepare(
+      `SELECT i.*, c.full_name AS client_name, p.name AS property_name, l.reference AS lease_reference,
+              (SELECT COALESCE(SUM(amount), 0) FROM payments WHERE invoice_id = i.id) AS paid_total
+       FROM invoices i
+       LEFT JOIN clients c ON c.id = i.client_id
+       LEFT JOIN properties p ON p.id = i.property_id
+       LEFT JOIN leases l ON l.id = i.lease_id
+       WHERE i.org_id = ?
+       ORDER BY i.created_at DESC, i.due_date DESC
+       LIMIT 5`
+    )
+    .all(orgId) as InvoiceWithRelations[];
+
+  const activity = db
+    .prepare('SELECT id, action, detail, created_at FROM activity_log WHERE org_id = ? ORDER BY created_at DESC LIMIT 6')
+    .all(orgId) as Activity[];
+
+  const upcomingLeases = db
+    .prepare(
+      `SELECT l.reference, l.end_date, p.name AS property_name, c.full_name AS client_name
+       FROM leases l
+       LEFT JOIN properties p ON p.id = l.property_id
+       LEFT JOIN clients c ON c.id = l.client_id
+       WHERE l.org_id = ? AND l.status = 'active' AND l.end_date IS NOT NULL
+         AND julianday(l.end_date) - julianday('now') BETWEEN 0 AND 90
+       ORDER BY l.end_date ASC
+       LIMIT 3`
+    )
+    .all(orgId) as { reference: string; end_date: string; property_name: string | null; client_name: string | null }[];
+
+  const collectionRate =
+    stats.revenue_this_month + stats.overdue_amount > 0
+      ? Math.round((stats.revenue_this_month / (stats.revenue_this_month + stats.overdue_amount)) * 100)
+      : 100;
+
+  const cards = [
+    { label: 'Biens totaux', value: String(stats.total_properties), hint: `${stats.available_properties} disponibles`, href: '/properties' },
+    { label: 'Clients', value: String(stats.total_clients), hint: 'Fiches enregistrées', href: '/clients' },
+    { label: 'Baux actifs', value: String(stats.active_leases), hint: `${stats.leased_properties} biens loués`, href: '/leases' },
+    { label: 'Factures en attente', value: String(stats.pending_invoices), hint: formatFCFA(stats.pending_amount), href: '/invoices' },
+    { label: 'Factures en retard', value: String(stats.overdue_invoices), hint: formatFCFA(stats.overdue_amount), href: '/invoices' },
+    { label: 'Recouvrement', value: String(stats.open_recovery_cases), hint: formatFCFA(stats.recovery_amount), href: '/recovery' },
+    { label: 'Encaissé ce mois', value: formatFCFA(stats.revenue_this_month), hint: `${stats.paid_this_month} factures payées`, href: '/invoices' },
+    { label: 'Taux de recouvrement', value: `${collectionRate}%`, hint: 'Mois en cours', href: '/invoices' },
+  ];
+
   return (
     <div className="space-y-6 animate-fade-in">
       {/* Titre */}
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-4 flex-wrap">
         <div>
           <h2 className="text-2xl font-bold text-navy-900 font-serif">Tableau de bord</h2>
           <p className="text-navy-500 mt-1">Aperçu de votre activité immobilière</p>
@@ -54,26 +114,28 @@ export default function DashboardPage() {
 
       {/* Statistiques */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        {stats.map((stat, i) => (
-          <div key={stat.label} className="stat-card animate-slide-in" style={{ animationDelay: `${i * 50}ms` }}>
-            <div className="stat-card-label">{stat.label}</div>
-            <div className="stat-card-value">{stat.value}</div>
-            <div className={`stat-card-change ${stat.positive === true ? 'positive' : stat.positive === false ? 'negative' : ''}`}>
-              {stat.positive === true && <svg className="w-3 h-3 inline mr-0.5" fill="currentColor" viewBox="0 0 20 20"><path d="M10 15.586l-5.293-5.293a1 1 0 011.414-1.414l5.293 5.293a1 1 0 01-1.414 1.414z" /><path d="M10 18a8 8 0 100-16 8 8 0 000 16z" /></svg>}
-              {stat.positive === false && <svg className="w-3 h-3 inline mr-0.5" fill="currentColor" viewBox="0 0 20 20"><path d="M10 4.414l5.293 5.293a1 1 0 01-1.414 1.414l-5.293-5.293a1 1 0 011.414-1.414z" /><path d="M10 2a8 8 0 100 16 8 8 0 000-16z" /></svg>}
-              {stat.change}
-            </div>
-          </div>
+        {cards.map((card, i) => (
+          <Link
+            key={card.label}
+            href={card.href}
+            className="stat-card card-hover animate-slide-in block"
+            style={{ animationDelay: `${i * 40}ms` }}
+          >
+            <div className="stat-card-label">{card.label}</div>
+            <div className="stat-card-value">{card.value}</div>
+            <div className="stat-card-change text-navy-500">{card.hint}</div>
+          </Link>
         ))}
       </div>
 
-      {/* Tableauments : Factures récentes + Activité */}
       <div className="grid md:grid-cols-2 gap-6">
         {/* Factures récentes */}
         <div className="bg-white rounded-xl border border-navy-100 shadow-sm overflow-hidden">
           <div className="px-5 py-4 border-b border-navy-100 flex items-center justify-between">
             <h3 className="font-semibold text-navy-900">Factures récentes</h3>
-            <Link href="/invoices" className="text-xs text-gold-500 hover:text-gold-600 font-medium">Voir tout →</Link>
+            <Link href="/invoices" className="text-xs text-gold-500 hover:text-gold-600 font-medium">
+              Voir tout →
+            </Link>
           </div>
           <div className="overflow-x-auto">
             <table className="data-table">
@@ -81,118 +143,127 @@ export default function DashboardPage() {
                 <tr>
                   <th>N°</th>
                   <th>Client</th>
-                  <th>Biens</th>
                   <th className="text-right">Montant</th>
                   <th>Échéance</th>
-                  <th>Status</th>
+                  <th>Statut</th>
                 </tr>
               </thead>
               <tbody>
-                {recentInvoices.map((inv) => (
-                  <tr key={inv.id}>
-                    <td className="font-mono text-xs text-navy-600">{inv.id}</td>
-                    <td className="font-medium text-navy-900">{inv.client}</td>
-                    <td className="text-navy-600">{inv.property}</td>
-                    <td className="text-right font-semibold">{inv.amount} FCFA</td>
-                    <td className="text-navy-600">{inv.due}</td>
-                    <td>
-                      <span className={`status-badge ${statusColors[inv.status]}`}>
-                        {inv.status === 'pending' && '⏳'}
-                        {inv.status === 'paid' && '✓'}
-                        {inv.status === 'overdue' && '⚠'}
-                        {inv.status}
-                      </span>
-                    </td>
-                  </tr>
-                ))}
+                {recentInvoices.map((inv) => {
+                  const s = statusOf(INVOICE_STATUS, inv.status);
+                  return (
+                    <tr key={inv.id}>
+                      <td className="font-mono text-xs text-navy-600">{inv.invoice_number}</td>
+                      <td className="font-medium text-navy-900">{inv.client_name ?? '—'}</td>
+                      <td className="text-right font-semibold whitespace-nowrap">{formatFCFA(inv.amount)}</td>
+                      <td className="text-navy-600 text-sm whitespace-nowrap">{formatDate(inv.due_date)}</td>
+                      <td>
+                        <StatusBadge tone={s.tone}>{s.label}</StatusBadge>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
+          {recentInvoices.length === 0 && (
+            <div className="py-10 text-center text-navy-500 text-sm">Aucune facture pour le moment.</div>
+          )}
         </div>
 
         {/* Activité récente */}
         <div className="bg-white rounded-xl border border-navy-100 shadow-sm overflow-hidden">
-          <div className="px-5 py-4 border-b border-navy-100 flex items-center justify-between">
+          <div className="px-5 py-4 border-b border-navy-100">
             <h3 className="font-semibold text-navy-900">Activité récente</h3>
           </div>
           <div className="divide-y divide-navy-50">
-            {recentActivity.map((activity, i) => (
-              <div key={i} className="px-5 py-3 flex items-start gap-3">
+            {activity.map((item) => (
+              <div key={item.id} className="px-5 py-3 flex items-start gap-3">
                 <div className="w-8 h-8 rounded-full bg-navy-100 flex items-center justify-center flex-shrink-0 mt-0.5">
                   <svg className="w-4 h-4 text-navy-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
                   </svg>
                 </div>
                 <div className="flex-1 min-w-0">
-                  <p className="text-sm font-medium text-navy-900 truncate">{activity.action}</p>
-                  <p className="text-xs text-navy-500 truncate">{activity.detail}</p>
+                  <p className="text-sm font-medium text-navy-900 truncate">{item.action}</p>
+                  <p className="text-xs text-navy-500 truncate">{item.detail}</p>
                 </div>
-                <span className="text-xs text-navy-400 flex-shrink-0 mt-0.5">{activity.time}</span>
+                <span className="text-xs text-navy-400 flex-shrink-0 mt-0.5">{timeAgo(item.created_at)}</span>
               </div>
             ))}
+            {activity.length === 0 && (
+              <div className="py-10 text-center text-navy-500 text-sm">Aucune activité enregistrée.</div>
+            )}
           </div>
         </div>
       </div>
 
-      {/* Alerts */}
+      {/* Alertes */}
       <div className="bg-white rounded-xl border border-navy-100 shadow-sm p-5">
-        <h3 className="font-semibold text-navy-900 mb-3">⚠ Alertes & Actions requises</h3>
+        <h3 className="font-semibold text-navy-900 mb-3">⚠ Alertes &amp; actions requises</h3>
         <div className="grid md:grid-cols-3 gap-4">
-          <div className="p-4 rounded-lg bg-red-50 border border-red-100">
-            <div className="flex items-center gap-2 text-red-700 font-medium text-sm mb-1">
-              <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
-                <path d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L8.586 12.828l1.293 1.293a1 1 0 001.414-1.414L8.586 11.414l1.293-1.293a1 1 0 00-1.414-1.414L8.586 8.707l-1.293-1.293z" />
-              </svg>
-              3 factures en retard
+          <div className={`p-4 rounded-lg border ${stats.overdue_invoices > 0 ? 'bg-red-50 border-red-100' : 'bg-navy-50 border-navy-100'}`}>
+            <div className={`font-medium text-sm mb-1 ${stats.overdue_invoices > 0 ? 'text-red-700' : 'text-navy-600'}`}>
+              {stats.overdue_invoices} facture{stats.overdue_invoices > 1 ? 's' : ''} en retard
             </div>
-            <p className="text-xs text-red-600">Montant total: 8 400 000 FCFA — Action: Relancer les locataires</p>
+            <p className="text-xs text-navy-600">
+              Montant total : {formatFCFA(stats.overdue_amount)}
+              {stats.overdue_invoices > 0 && (
+                <>
+                  {' — '}
+                  <Link href="/reminders" className="underline font-medium">
+                    Relancer les locataires
+                  </Link>
+                </>
+              )}
+            </p>
           </div>
-          <div className="p-4 rounded-lg bg-amber-50 border border-amber-100">
-            <div className="flex items-center gap-2 text-amber-700 font-medium text-sm mb-1">
-              <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
-                <path d="M10 12.5a2.5 2.5 0 100-5 2.5 2.5 0 000 5z" />
-                <path d="M10 1.5a9 9 0 100 18 9 9 0 000-18zM14.5 10a4.5 4.5 0 11-9 0 4.5 4.5 0 019 0z" />
-              </svg>
-              2 contrats expirent ce mois
+
+          <div className={`p-4 rounded-lg border ${upcomingLeases.length > 0 ? 'bg-amber-50 border-amber-100' : 'bg-navy-50 border-navy-100'}`}>
+            <div className={`font-medium text-sm mb-1 ${upcomingLeases.length > 0 ? 'text-amber-700' : 'text-navy-600'}`}>
+              {upcomingLeases.length} contrat{upcomingLeases.length > 1 ? 's' : ''} à échéance
             </div>
-            <p className="text-xs text-amber-600">Renouvellement des baux à prévoir</p>
+            <p className="text-xs text-navy-600">
+              {upcomingLeases.length > 0
+                ? `Prochain : ${upcomingLeases[0].property_name} — ${formatDate(upcomingLeases[0].end_date)}`
+                : 'Aucun renouvellement dans les 90 jours'}
+            </p>
           </div>
-          <div className="p-4 rounded-lg bg-blue-50 border border-blue-100">
-            <div className="flex items-center gap-2 text-blue-700 font-medium text-sm mb-1">
-              <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
-                <path d="M9 4.804A7.963 7.963 0 005.5 4c-1.732 0-3 .586-4.208 1.656C2.5 6.668 1.5 8.716 1.5 11h11c0-2.284-.5-3.832-1.196-4.896-.704-.964-1.966-1.45-3.208-1.45z" />
-                <path d="M12.5 15.5a2.5 2.5 0 100-5 2.5 2.5 0 000 5z" />
-              </svg>
-              Nouveau lead
+
+          <div className={`p-4 rounded-lg border ${stats.open_recovery_cases > 0 ? 'bg-blue-50 border-blue-100' : 'bg-navy-50 border-navy-100'}`}>
+            <div className={`font-medium text-sm mb-1 ${stats.open_recovery_cases > 0 ? 'text-blue-700' : 'text-navy-600'}`}>
+              {stats.open_recovery_cases} dossier{stats.open_recovery_cases > 1 ? 's' : ''} de recouvrement
             </div>
-            <p className="text-xs text-blue-600">M. Guessan Koffi — Villa request — À contacter</p>
+            <p className="text-xs text-navy-600">
+              {formatFCFA(stats.recovery_amount)} à récupérer
+              {stats.open_recovery_cases > 0 && (
+                <>
+                  {' — '}
+                  <Link href="/recovery" className="underline font-medium">
+                    Voir les dossiers
+                  </Link>
+                </>
+              )}
+            </p>
           </div>
         </div>
       </div>
 
-      {/* Billets rapides */}
+      {/* Indicateur de recouvrement */}
       <div className="bg-white rounded-xl border border-navy-100 shadow-sm p-5">
-        <div className="flex items-center justify-between mb-3">
-          <h3 className="font-semibold text-navy-900">📊 Billets rapides</h3>
+        <h3 className="font-semibold text-navy-900 mb-3">📊 Taux de recouvrement — mois en cours</h3>
+        <div className="flex items-center gap-4">
+          <div className="flex-1 bg-navy-100 rounded-full h-3">
+            <div
+              className={`h-3 rounded-full ${collectionRate >= 80 ? 'bg-green-500' : collectionRate >= 50 ? 'bg-yellow-400' : 'bg-red-500'}`}
+              style={{ width: `${collectionRate}%` }}
+            />
+          </div>
+          <span className="text-lg font-bold text-navy-900 font-serif">{collectionRate}%</span>
         </div>
-        <div className="grid grid-cols-5 gap-3">
-          {[
-            { label: 'Mars', value: 92, color: 'bg-green-500' },
-            { label: 'Avr', value: 88, color: 'bg-green-400' },
-            { label: 'Mai', value: 95, color: 'bg-green-500' },
-            { label: 'Jun', value: 85, color: 'bg-green-400' },
-            { label: 'Juil', value: 78, color: 'bg-yellow-400' },
-          ].map((m) => (
-            <div key={m.label} className="text-center">
-              <div className="text-xs text-navy-500 mb-1">{m.label}</div>
-              <div className="w-full bg-navy-100 rounded-full h-2 mb-1">
-                <div className={`${m.color} h-2 rounded-full`} style={{ width: `${m.value}%` }} />
-              </div>
-              <div className="text-xs font-medium text-navy-700">{m.value}%</div>
-            </div>
-          ))}
-        </div>
-        <p className="text-xs text-navy-400 mt-3 text-center">Taux de recouvrement des loyers — 5 derniers mois</p>
+        <p className="text-xs text-navy-400 mt-3">
+          {formatFCFA(stats.revenue_this_month)} encaissés · {formatFCFA(stats.overdue_amount)} en retard
+        </p>
       </div>
     </div>
   );
