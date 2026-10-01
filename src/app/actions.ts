@@ -790,7 +790,10 @@ export async function createUser(formData: FormData): Promise<ActionState> {
   const newId = created.user?.id;
 
   if (newId) {
-    const { data: profile } = await supabase
+    // Lecture via le client d'administration : le profil du nouvel utilisateur
+    // appartient à l'organisation créée par le trigger, invisible pour
+    // l'invitant à cause du RLS.
+    const { data: profile } = await admin
       .from('profiles')
       .select('organization_id')
       .eq('id', newId)
