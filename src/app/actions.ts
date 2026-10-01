@@ -2,22 +2,16 @@
 
 import { redirect } from 'next/navigation';
 import { revalidatePath } from 'next/cache';
-import { randomUUID } from 'node:crypto';
-import {
-  getDb,
-  hashPassword,
-  logActivity,
-  nextInvoiceNumber,
-  nextReference,
-  verifyPassword,
-} from '@/lib/db';
-import { login, register, destroySession, getSession } from '@/lib/auth';
+import { createServerSupabase } from '@/lib/supabase';
+import { login, register, logout, requireUser, type SessionUser } from '@/lib/auth';
 
 /* ------------------------------------------------------------------ */
 /* Type de retour commun                                               */
 /* ------------------------------------------------------------------ */
 
 export type ActionState = { ok: boolean; error?: string; message?: string };
+
+const GENERIC_ERROR = 'Une erreur est survenue. Veuillez réessayer.';
 
 function str(fd: FormData, key: string): string {
   return String(fd.get(key) ?? '').trim();
@@ -30,9 +24,7 @@ function num(fd: FormData, key: string): number {
 }
 
 function optNum(fd: FormData, key: string): number | null {
-  const raw = str(fd, key);
-  if (!raw) return null;
-  return num(fd, key);
+  return str(fd, key) === '' ? null : num(fd, key);
 }
 
 function nullable(fd: FormData, key: string): string | null {
@@ -40,14 +32,39 @@ function nullable(fd: FormData, key: string): string | null {
   return v === '' ? null : v;
 }
 
-async function requireUser() {
-  const user = getSession();
-  if (!user) redirect('/login');
-  return user;
-}
-
 function refresh(paths: string[]) {
   for (const p of paths) revalidatePath(p);
+}
+
+type Supabase = ReturnType<typeof createServerSupabase>;
+
+/** Journalise une action dans le fil d'activité de l'organisation. */
+async function logActivity(supabase: Supabase, user: SessionUser, action: string, detail: string) {
+  await supabase.from('activity_log').insert({
+    organization_id: user.org_id,
+    user_id: user.id,
+    action,
+    detail,
+  });
+}
+
+/** Génère une référence séquentielle (bail, dossier de recouvrement). */
+async function nextReference(
+  supabase: Supabase,
+  orgId: string,
+  table: 'leases' | 'recovery_cases',
+  prefix: string
+): Promise<string> {
+  const year = new Date().getFullYear();
+  const { count } = await supabase
+    .from(table)
+    .select('id', { count: 'exact', head: true })
+    .eq('organization_id', orgId);
+  return `${prefix}-${year}-${String((count ?? 0) + 1).padStart(4, '0')}`;
+}
+
+function formatAmount(n: number): string {
+  return Math.round(n).toLocaleString('fr-FR').replace(/\u202f|\u00a0/g, ' ');
 }
 
 /* ------------------------------------------------------------------ */
@@ -62,7 +79,7 @@ export async function loginAction(formData: FormData): Promise<ActionState> {
     return { ok: false, error: 'Veuillez remplir tous les champs.' };
   }
 
-  const result = login(email, password);
+  const result = await login(email, password);
   if (!result.ok) return result;
 
   redirect('/dashboard');
@@ -75,8 +92,11 @@ export async function registerAction(formData: FormData): Promise<ActionState> {
   if (password !== confirmPassword) {
     return { ok: false, error: 'Les mots de passe ne correspondent pas.' };
   }
+  if (password.length < 8) {
+    return { ok: false, error: 'Le mot de passe doit contenir au moins 8 caractères.' };
+  }
 
-  const result = register({
+  const result = await register({
     organizationName: str(formData, 'organizationName'),
     fullName: str(formData, 'fullName'),
     email: str(formData, 'email'),
@@ -88,7 +108,7 @@ export async function registerAction(formData: FormData): Promise<ActionState> {
 }
 
 export async function logoutAction(): Promise<void> {
-  destroySession();
+  await logout();
   redirect('/login');
 }
 
@@ -98,84 +118,82 @@ export async function logoutAction(): Promise<void> {
 
 export async function createProperty(formData: FormData): Promise<ActionState> {
   const user = await requireUser();
+  const supabase = createServerSupabase();
   const name = str(formData, 'name');
   const address = str(formData, 'address');
 
   if (!name) return { ok: false, error: 'Le nom du bien est requis.' };
   if (!address) return { ok: false, error: "L'adresse est requise." };
 
-  getDb()
-    .prepare(
-      `INSERT INTO properties (id, org_id, name, type, address, city, surface, rooms, bedrooms, bathrooms, price, rental_price, status, featured, description, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-    .run(
-      randomUUID(),
-      user.org_id,
-      name,
-      str(formData, 'type') || 'appartement',
-      address,
-      nullable(formData, 'city'),
-      optNum(formData, 'surface'),
-      optNum(formData, 'rooms'),
-      optNum(formData, 'bedrooms'),
-      optNum(formData, 'bathrooms'),
-      optNum(formData, 'price'),
-      optNum(formData, 'rental_price'),
-      str(formData, 'status') || 'disponible',
-      formData.get('featured') ? 1 : 0,
-      nullable(formData, 'description'),
-      new Date().toISOString()
-    );
+  const { error } = await supabase.from('properties').insert({
+    organization_id: user.org_id,
+    name,
+    type: str(formData, 'type') || 'appartement',
+    address,
+    city: nullable(formData, 'city'),
+    surface: optNum(formData, 'surface'),
+    rooms: optNum(formData, 'rooms'),
+    bedrooms: optNum(formData, 'bedrooms'),
+    bathrooms: optNum(formData, 'bathrooms'),
+    price: optNum(formData, 'price'),
+    rental_price: optNum(formData, 'rental_price'),
+    status: str(formData, 'status') || 'disponible',
+    featured: formData.get('featured') !== null,
+    description: nullable(formData, 'description'),
+  });
 
-  logActivity(user.org_id, user.id, 'Bien ajouté', `${name} — ${address}`);
+  if (error) return { ok: false, error: GENERIC_ERROR };
+
+  await logActivity(supabase, user, 'Bien ajouté', `${name} — ${address}`);
   refresh(['/properties', '/dashboard']);
   return { ok: true, message: `Le bien « ${name} » a été ajouté.` };
 }
 
 export async function updateProperty(formData: FormData): Promise<ActionState> {
   const user = await requireUser();
+  const supabase = createServerSupabase();
   const id = str(formData, 'id');
   const name = str(formData, 'name');
   if (!id || !name) return { ok: false, error: 'Données incomplètes.' };
 
-  getDb()
-    .prepare(
-      `UPDATE properties SET name = ?, type = ?, address = ?, city = ?, surface = ?, rooms = ?, bedrooms = ?,
-        bathrooms = ?, price = ?, rental_price = ?, status = ?, featured = ?, description = ?
-       WHERE id = ? AND org_id = ?`
-    )
-    .run(
+  const { error } = await supabase
+    .from('properties')
+    .update({
       name,
-      str(formData, 'type') || 'appartement',
-      str(formData, 'address'),
-      nullable(formData, 'city'),
-      optNum(formData, 'surface'),
-      optNum(formData, 'rooms'),
-      optNum(formData, 'bedrooms'),
-      optNum(formData, 'bathrooms'),
-      optNum(formData, 'price'),
-      optNum(formData, 'rental_price'),
-      str(formData, 'status') || 'disponible',
-      formData.get('featured') ? 1 : 0,
-      nullable(formData, 'description'),
-      id,
-      user.org_id
-    );
+      type: str(formData, 'type') || 'appartement',
+      address: str(formData, 'address'),
+      city: nullable(formData, 'city'),
+      surface: optNum(formData, 'surface'),
+      rooms: optNum(formData, 'rooms'),
+      bedrooms: optNum(formData, 'bedrooms'),
+      bathrooms: optNum(formData, 'bathrooms'),
+      price: optNum(formData, 'price'),
+      rental_price: optNum(formData, 'rental_price'),
+      status: str(formData, 'status') || 'disponible',
+      featured: formData.get('featured') !== null,
+      description: nullable(formData, 'description'),
+    })
+    .eq('id', id)
+    .eq('organization_id', user.org_id);
 
-  logActivity(user.org_id, user.id, 'Bien modifié', name);
+  if (error) return { ok: false, error: GENERIC_ERROR };
+
+  await logActivity(supabase, user, 'Bien modifié', name);
   refresh(['/properties', '/dashboard']);
   return { ok: true, message: `Le bien « ${name} » a été mis à jour.` };
 }
 
 export async function deleteProperty(formData: FormData): Promise<ActionState> {
   const user = await requireUser();
+  const supabase = createServerSupabase();
   const id = str(formData, 'id');
   const name = str(formData, 'name');
   if (!id) return { ok: false, error: 'Identifiant manquant.' };
 
-  getDb().prepare('DELETE FROM properties WHERE id = ? AND org_id = ?').run(id, user.org_id);
-  logActivity(user.org_id, user.id, 'Bien supprimé', name);
+  const { error } = await supabase.from('properties').delete().eq('id', id).eq('organization_id', user.org_id);
+  if (error) return { ok: false, error: GENERIC_ERROR };
+
+  await logActivity(supabase, user, 'Bien supprimé', name);
   refresh(['/properties', '/dashboard', '/leases']);
   return { ok: true, message: `Le bien « ${name} » a été supprimé.` };
 }
@@ -186,72 +204,71 @@ export async function deleteProperty(formData: FormData): Promise<ActionState> {
 
 export async function createClient(formData: FormData): Promise<ActionState> {
   const user = await requireUser();
+  const supabase = createServerSupabase();
   const fullName = str(formData, 'full_name');
   if (!fullName) return { ok: false, error: 'Le nom du client est requis.' };
 
-  getDb()
-    .prepare(
-      `INSERT INTO clients (id, org_id, property_id, type, full_name, email, phone, address, city, status, notes, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-    .run(
-      randomUUID(),
-      user.org_id,
-      nullable(formData, 'property_id'),
-      str(formData, 'type') || 'locataire',
-      fullName,
-      nullable(formData, 'email'),
-      nullable(formData, 'phone'),
-      nullable(formData, 'address'),
-      nullable(formData, 'city'),
-      str(formData, 'status') || 'actif',
-      nullable(formData, 'notes'),
-      new Date().toISOString()
-    );
+  const { error } = await supabase.from('clients').insert({
+    organization_id: user.org_id,
+    property_id: nullable(formData, 'property_id'),
+    type: str(formData, 'type') || 'locataire',
+    full_name: fullName,
+    email: nullable(formData, 'email'),
+    phone: nullable(formData, 'phone'),
+    address: nullable(formData, 'address'),
+    city: nullable(formData, 'city'),
+    status: str(formData, 'status') || 'actif',
+    notes: nullable(formData, 'notes'),
+  });
 
-  logActivity(user.org_id, user.id, 'Client ajouté', fullName);
+  if (error) return { ok: false, error: GENERIC_ERROR };
+
+  await logActivity(supabase, user, 'Client ajouté', fullName);
   refresh(['/clients', '/dashboard']);
   return { ok: true, message: `Le client « ${fullName} » a été ajouté.` };
 }
 
 export async function updateClient(formData: FormData): Promise<ActionState> {
   const user = await requireUser();
+  const supabase = createServerSupabase();
   const id = str(formData, 'id');
   const fullName = str(formData, 'full_name');
   if (!id || !fullName) return { ok: false, error: 'Données incomplètes.' };
 
-  getDb()
-    .prepare(
-      `UPDATE clients SET property_id = ?, type = ?, full_name = ?, email = ?, phone = ?, address = ?, city = ?, status = ?, notes = ?
-       WHERE id = ? AND org_id = ?`
-    )
-    .run(
-      nullable(formData, 'property_id'),
-      str(formData, 'type') || 'locataire',
-      fullName,
-      nullable(formData, 'email'),
-      nullable(formData, 'phone'),
-      nullable(formData, 'address'),
-      nullable(formData, 'city'),
-      str(formData, 'status') || 'actif',
-      nullable(formData, 'notes'),
-      id,
-      user.org_id
-    );
+  const { error } = await supabase
+    .from('clients')
+    .update({
+      property_id: nullable(formData, 'property_id'),
+      type: str(formData, 'type') || 'locataire',
+      full_name: fullName,
+      email: nullable(formData, 'email'),
+      phone: nullable(formData, 'phone'),
+      address: nullable(formData, 'address'),
+      city: nullable(formData, 'city'),
+      status: str(formData, 'status') || 'actif',
+      notes: nullable(formData, 'notes'),
+    })
+    .eq('id', id)
+    .eq('organization_id', user.org_id);
 
-  logActivity(user.org_id, user.id, 'Client modifié', fullName);
+  if (error) return { ok: false, error: GENERIC_ERROR };
+
+  await logActivity(supabase, user, 'Client modifié', fullName);
   refresh(['/clients', '/dashboard']);
   return { ok: true, message: `Le client « ${fullName} » a été mis à jour.` };
 }
 
 export async function deleteClient(formData: FormData): Promise<ActionState> {
   const user = await requireUser();
+  const supabase = createServerSupabase();
   const id = str(formData, 'id');
   const fullName = str(formData, 'name');
   if (!id) return { ok: false, error: 'Identifiant manquant.' };
 
-  getDb().prepare('DELETE FROM clients WHERE id = ? AND org_id = ?').run(id, user.org_id);
-  logActivity(user.org_id, user.id, 'Client supprimé', fullName);
+  const { error } = await supabase.from('clients').delete().eq('id', id).eq('organization_id', user.org_id);
+  if (error) return { ok: false, error: GENERIC_ERROR };
+
+  await logActivity(supabase, user, 'Client supprimé', fullName);
   refresh(['/clients', '/dashboard', '/leases']);
   return { ok: true, message: `Le client « ${fullName} » a été supprimé.` };
 }
@@ -262,6 +279,7 @@ export async function deleteClient(formData: FormData): Promise<ActionState> {
 
 export async function createLease(formData: FormData): Promise<ActionState> {
   const user = await requireUser();
+  const supabase = createServerSupabase();
   const propertyId = str(formData, 'property_id');
   const clientId = str(formData, 'client_id');
   const startDate = str(formData, 'start_date');
@@ -273,73 +291,72 @@ export async function createLease(formData: FormData): Promise<ActionState> {
   const rent = num(formData, 'monthly_rent');
   if (rent <= 0) return { ok: false, error: 'Le loyer mensuel doit être supérieur à 0.' };
 
-  const db = getDb();
-  const id = randomUUID();
-  const reference = nextReference(user.org_id, 'leases', 'LE');
+  const status = str(formData, 'status') || 'active';
+  const reference = await nextReference(supabase, user.org_id, 'leases', 'LE');
 
-  db.prepare(
-    `INSERT INTO leases (id, org_id, reference, property_id, client_id, start_date, end_date, monthly_rent, deposit, status, notes, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    id,
-    user.org_id,
+  const { error } = await supabase.from('leases').insert({
+    organization_id: user.org_id,
     reference,
-    propertyId,
-    clientId,
-    startDate,
-    nullable(formData, 'end_date'),
-    rent,
-    num(formData, 'deposit'),
-    str(formData, 'status') || 'active',
-    nullable(formData, 'notes'),
-    new Date().toISOString()
-  );
+    property_id: propertyId,
+    client_id: clientId,
+    start_date: startDate,
+    end_date: nullable(formData, 'end_date'),
+    monthly_rent: rent,
+    deposit: num(formData, 'deposit'),
+    status,
+    notes: nullable(formData, 'notes'),
+  });
 
-  // Le bien passe automatiquement en « loué » lorsqu'un bail actif est créé.
-  if ((str(formData, 'status') || 'active') === 'active') {
-    db.prepare(`UPDATE properties SET status = 'loué' WHERE id = ? AND org_id = ?`).run(propertyId, user.org_id);
+  if (error) return { ok: false, error: GENERIC_ERROR };
+
+  // Un bail actif fait passer le bien en « loué ».
+  if (status === 'active') {
+    await supabase.from('properties').update({ status: 'loué' }).eq('id', propertyId).eq('organization_id', user.org_id);
   }
 
-  logActivity(user.org_id, user.id, 'Nouveau bail créé', `${reference} — ${str(formData, 'client_name')}`);
+  await logActivity(supabase, user, 'Nouveau bail créé', `${reference} — ${str(formData, 'client_name')}`);
   refresh(['/leases', '/properties', '/dashboard']);
   return { ok: true, message: `Le bail ${reference} a été créé.` };
 }
 
 export async function updateLease(formData: FormData): Promise<ActionState> {
   const user = await requireUser();
+  const supabase = createServerSupabase();
   const id = str(formData, 'id');
   if (!id) return { ok: false, error: 'Identifiant manquant.' };
 
-  getDb()
-    .prepare(
-      `UPDATE leases SET property_id = ?, client_id = ?, start_date = ?, end_date = ?, monthly_rent = ?, deposit = ?, status = ?, notes = ?
-       WHERE id = ? AND org_id = ?`
-    )
-    .run(
-      str(formData, 'property_id'),
-      str(formData, 'client_id'),
-      str(formData, 'start_date'),
-      nullable(formData, 'end_date'),
-      num(formData, 'monthly_rent'),
-      num(formData, 'deposit'),
-      str(formData, 'status') || 'active',
-      nullable(formData, 'notes'),
-      id,
-      user.org_id
-    );
+  const { error } = await supabase
+    .from('leases')
+    .update({
+      property_id: str(formData, 'property_id'),
+      client_id: str(formData, 'client_id'),
+      start_date: str(formData, 'start_date'),
+      end_date: nullable(formData, 'end_date'),
+      monthly_rent: num(formData, 'monthly_rent'),
+      deposit: num(formData, 'deposit'),
+      status: str(formData, 'status') || 'active',
+      notes: nullable(formData, 'notes'),
+    })
+    .eq('id', id)
+    .eq('organization_id', user.org_id);
 
-  logActivity(user.org_id, user.id, 'Bail modifié', str(formData, 'reference'));
+  if (error) return { ok: false, error: GENERIC_ERROR };
+
+  await logActivity(supabase, user, 'Bail modifié', str(formData, 'reference'));
   refresh(['/leases', '/properties', '/dashboard']);
   return { ok: true, message: 'Le bail a été mis à jour.' };
 }
 
 export async function deleteLease(formData: FormData): Promise<ActionState> {
   const user = await requireUser();
+  const supabase = createServerSupabase();
   const id = str(formData, 'id');
   if (!id) return { ok: false, error: 'Identifiant manquant.' };
 
-  getDb().prepare('DELETE FROM leases WHERE id = ? AND org_id = ?').run(id, user.org_id);
-  logActivity(user.org_id, user.id, 'Bail supprimé', str(formData, 'reference'));
+  const { error } = await supabase.from('leases').delete().eq('id', id).eq('organization_id', user.org_id);
+  if (error) return { ok: false, error: GENERIC_ERROR };
+
+  await logActivity(supabase, user, 'Bail supprimé', str(formData, 'reference'));
   refresh(['/leases', '/dashboard']);
   return { ok: true, message: 'Le bail a été supprimé.' };
 }
@@ -350,95 +367,99 @@ export async function deleteLease(formData: FormData): Promise<ActionState> {
 
 export async function createInvoice(formData: FormData): Promise<ActionState> {
   const user = await requireUser();
+  const supabase = createServerSupabase();
   const amount = num(formData, 'amount');
   const dueDate = str(formData, 'due_date');
 
   if (amount <= 0) return { ok: false, error: 'Le montant doit être supérieur à 0.' };
   if (!dueDate) return { ok: false, error: "La date d'échéance est requise." };
 
-  const db = getDb();
-  const id = randomUUID();
-  const invoiceNumber = nextInvoiceNumber(user.org_id);
   let clientId = nullable(formData, 'client_id');
   let propertyId = nullable(formData, 'property_id');
   const leaseId = nullable(formData, 'lease_id');
 
-  // Si la facture est rattachée à un bail, on hérite du client et du bien.
+  // Une facture rattachée à un bail hérite du client et du bien.
   if (leaseId) {
-    const lease = db
-      .prepare('SELECT property_id, client_id FROM leases WHERE id = ? AND org_id = ?')
-      .get(leaseId, user.org_id) as { property_id: string; client_id: string } | undefined;
+    const { data: lease } = await supabase
+      .from('leases')
+      .select('property_id, client_id')
+      .eq('id', leaseId)
+      .eq('organization_id', user.org_id)
+      .maybeSingle();
     if (lease) {
-      propertyId = lease.property_id;
-      clientId = clientId ?? lease.client_id;
+      propertyId = lease.property_id as string;
+      clientId = clientId ?? (lease.client_id as string);
     }
   }
 
-  db.prepare(
-    `INSERT INTO invoices (id, org_id, lease_id, client_id, property_id, invoice_number, amount, due_date, paid_date, status, recurrence, description, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    id,
-    user.org_id,
-    leaseId,
-    clientId,
-    propertyId,
-    invoiceNumber,
-    amount,
-    dueDate,
-    null,
-    str(formData, 'status') || 'pending',
-    str(formData, 'recurrence') || 'monthly',
-    nullable(formData, 'description'),
-    new Date().toISOString()
-  );
+  const { data: generated } = await supabase.rpc('next_invoice_number', { p_org: user.org_id });
+  const invoiceNumber = (generated as string) ?? `INV-${new Date().getFullYear()}-0001`;
 
-  logActivity(user.org_id, user.id, 'Facture créée', `${invoiceNumber} — ${str(formData, 'client_name')}`);
+  const { error } = await supabase.from('invoices').insert({
+    organization_id: user.org_id,
+    lease_id: leaseId,
+    client_id: clientId,
+    property_id: propertyId,
+    invoice_number: invoiceNumber,
+    amount,
+    due_date: dueDate,
+    status: str(formData, 'status') || 'pending',
+    recurrence: str(formData, 'recurrence') || 'monthly',
+    description: nullable(formData, 'description'),
+  });
+
+  if (error) return { ok: false, error: GENERIC_ERROR };
+
+  await logActivity(supabase, user, 'Facture créée', `${invoiceNumber} — ${str(formData, 'client_name')}`);
   refresh(['/invoices', '/dashboard']);
   return { ok: true, message: `La facture ${invoiceNumber} a été créée.` };
 }
 
 export async function updateInvoice(formData: FormData): Promise<ActionState> {
   const user = await requireUser();
+  const supabase = createServerSupabase();
   const id = str(formData, 'id');
   if (!id) return { ok: false, error: 'Identifiant manquant.' };
 
-  getDb()
-    .prepare(
-      `UPDATE invoices SET client_id = ?, property_id = ?, amount = ?, due_date = ?, status = ?, recurrence = ?, description = ?
-       WHERE id = ? AND org_id = ?`
-    )
-    .run(
-      nullable(formData, 'client_id'),
-      nullable(formData, 'property_id'),
-      num(formData, 'amount'),
-      str(formData, 'due_date'),
-      str(formData, 'status') || 'pending',
-      str(formData, 'recurrence') || 'monthly',
-      nullable(formData, 'description'),
-      id,
-      user.org_id
-    );
+  const { error } = await supabase
+    .from('invoices')
+    .update({
+      client_id: nullable(formData, 'client_id'),
+      property_id: nullable(formData, 'property_id'),
+      amount: num(formData, 'amount'),
+      due_date: str(formData, 'due_date'),
+      status: str(formData, 'status') || 'pending',
+      recurrence: str(formData, 'recurrence') || 'monthly',
+      description: nullable(formData, 'description'),
+    })
+    .eq('id', id)
+    .eq('organization_id', user.org_id);
 
-  logActivity(user.org_id, user.id, 'Facture modifiée', str(formData, 'invoice_number'));
+  if (error) return { ok: false, error: GENERIC_ERROR };
+
+  await logActivity(supabase, user, 'Facture modifiée', str(formData, 'invoice_number'));
   refresh(['/invoices', '/dashboard']);
   return { ok: true, message: 'La facture a été mise à jour.' };
 }
 
 export async function deleteInvoice(formData: FormData): Promise<ActionState> {
   const user = await requireUser();
+  const supabase = createServerSupabase();
   const id = str(formData, 'id');
   if (!id) return { ok: false, error: 'Identifiant manquant.' };
 
-  getDb().prepare('DELETE FROM invoices WHERE id = ? AND org_id = ?').run(id, user.org_id);
-  logActivity(user.org_id, user.id, 'Facture supprimée', str(formData, 'invoice_number'));
+  const { error } = await supabase.from('invoices').delete().eq('id', id).eq('organization_id', user.org_id);
+  if (error) return { ok: false, error: GENERIC_ERROR };
+
+  await logActivity(supabase, user, 'Facture supprimée', str(formData, 'invoice_number'));
   refresh(['/invoices', '/dashboard']);
   return { ok: true, message: 'La facture a été supprimée.' };
 }
 
-/** Enregistre un paiement et solde la facture associée. */
+/** Enregistre un paiement et solde la facture si le total est atteint. */
 export async function recordPayment(formData: FormData): Promise<ActionState> {
   const user = await requireUser();
+  const supabase = createServerSupabase();
   const invoiceId = str(formData, 'invoice_id');
   const amount = num(formData, 'amount');
   const paymentDate = str(formData, 'payment_date') || new Date().toISOString().slice(0, 10);
@@ -446,44 +467,41 @@ export async function recordPayment(formData: FormData): Promise<ActionState> {
   if (!invoiceId) return { ok: false, error: 'Facture introuvable.' };
   if (amount <= 0) return { ok: false, error: 'Le montant doit être supérieur à 0.' };
 
-  const db = getDb();
-  const invoice = db
-    .prepare('SELECT id, invoice_number, amount FROM invoices WHERE id = ? AND org_id = ?')
-    .get(invoiceId, user.org_id) as { id: string; invoice_number: string; amount: number } | undefined;
+  const { data: invoice } = await supabase
+    .from('invoices')
+    .select('id, invoice_number, amount')
+    .eq('id', invoiceId)
+    .eq('organization_id', user.org_id)
+    .maybeSingle();
 
   if (!invoice) return { ok: false, error: 'Facture introuvable.' };
 
-  db.prepare(
-    `INSERT INTO payments (id, org_id, invoice_id, amount, payment_date, method, reference, notes, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    randomUUID(),
-    user.org_id,
-    invoiceId,
+  const { error } = await supabase.from('payments').insert({
+    organization_id: user.org_id,
+    invoice_id: invoiceId,
     amount,
-    paymentDate,
-    str(formData, 'method') || 'cash',
-    nullable(formData, 'reference'),
-    nullable(formData, 'notes'),
-    new Date().toISOString()
-  );
+    payment_date: paymentDate,
+    method: str(formData, 'method') || 'cash',
+    reference: nullable(formData, 'reference'),
+    notes: nullable(formData, 'notes'),
+  });
 
-  // Une facture est considérée payée dès que le total des paiements couvre le montant dû.
-  const totalPaid = db
-    .prepare('SELECT COALESCE(SUM(amount), 0) AS total FROM payments WHERE invoice_id = ?')
-    .get(invoiceId) as { total: number };
+  if (error) return { ok: false, error: GENERIC_ERROR };
 
-  if (totalPaid.total >= invoice.amount) {
-    db.prepare(`UPDATE invoices SET status = 'paid', paid_date = ? WHERE id = ?`).run(paymentDate, invoiceId);
+  const { data: payments } = await supabase.from('payments').select('amount').eq('invoice_id', invoiceId);
+  const totalPaid = (payments ?? []).reduce((sum, p) => sum + Number(p.amount ?? 0), 0);
+
+  if (totalPaid >= Number(invoice.amount)) {
+    await supabase
+      .from('invoices')
+      .update({ status: 'paid', paid_date: paymentDate })
+      .eq('id', invoiceId)
+      .eq('organization_id', user.org_id);
   }
 
-  logActivity(user.org_id, user.id, 'Paiement enregistré', `${formatAmount(amount)} FCFA — ${invoice.invoice_number}`);
+  await logActivity(supabase, user, 'Paiement enregistré', `${formatAmount(amount)} FCFA — ${invoice.invoice_number}`);
   refresh(['/invoices', '/dashboard', '/recovery']);
   return { ok: true, message: `Paiement de ${formatAmount(amount)} FCFA enregistré sur ${invoice.invoice_number}.` };
-}
-
-function formatAmount(n: number): string {
-  return Math.round(n).toLocaleString('fr-FR').replace(/\u202f|\u00a0/g, ' ');
 }
 
 /* ------------------------------------------------------------------ */
@@ -492,67 +510,66 @@ function formatAmount(n: number): string {
 
 export async function createReminder(formData: FormData): Promise<ActionState> {
   const user = await requireUser();
+  const supabase = createServerSupabase();
   const scheduledDate = str(formData, 'scheduled_date');
   if (!scheduledDate) return { ok: false, error: 'La date de programmation est requise.' };
 
-  const db = getDb();
   const invoiceId = nullable(formData, 'invoice_id');
   let clientId = nullable(formData, 'client_id');
 
   if (invoiceId && !clientId) {
-    const inv = db
-      .prepare('SELECT client_id FROM invoices WHERE id = ? AND org_id = ?')
-      .get(invoiceId, user.org_id) as { client_id: string | null } | undefined;
-    clientId = inv?.client_id ?? null;
+    const { data: inv } = await supabase
+      .from('invoices')
+      .select('client_id')
+      .eq('id', invoiceId)
+      .eq('organization_id', user.org_id)
+      .maybeSingle();
+    clientId = (inv?.client_id as string) ?? null;
   }
 
-  db.prepare(
-    `INSERT INTO reminders (id, org_id, invoice_id, client_id, type, subject, message, scheduled_date, sent_at, status, channel, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    randomUUID(),
-    user.org_id,
-    invoiceId,
-    clientId,
-    str(formData, 'type') || 'rent_reminder',
-    nullable(formData, 'subject'),
-    nullable(formData, 'message'),
-    scheduledDate,
-    null,
-    'pending',
-    str(formData, 'channel') || 'email',
-    new Date().toISOString()
-  );
+  const { error } = await supabase.from('reminders').insert({
+    organization_id: user.org_id,
+    invoice_id: invoiceId,
+    client_id: clientId,
+    type: str(formData, 'type') || 'rent_reminder',
+    subject: nullable(formData, 'subject'),
+    message: nullable(formData, 'message'),
+    scheduled_date: scheduledDate,
+    status: 'pending',
+    channel: str(formData, 'channel') || 'email',
+  });
 
-  logActivity(user.org_id, user.id, 'Relance programmée', str(formData, 'subject') || 'Relance');
+  if (error) return { ok: false, error: GENERIC_ERROR };
+
+  await logActivity(supabase, user, 'Relance programmée', str(formData, 'subject') || 'Relance');
   refresh(['/reminders', '/dashboard']);
   return { ok: true, message: 'La relance a été programmée.' };
 }
 
 export async function updateReminder(formData: FormData): Promise<ActionState> {
   const user = await requireUser();
+  const supabase = createServerSupabase();
   const id = str(formData, 'id');
   if (!id) return { ok: false, error: 'Identifiant manquant.' };
 
-  getDb()
-    .prepare(
-      `UPDATE reminders SET invoice_id = ?, client_id = ?, type = ?, subject = ?, message = ?, scheduled_date = ?, status = ?, channel = ?
-       WHERE id = ? AND org_id = ?`
-    )
-    .run(
-      nullable(formData, 'invoice_id'),
-      nullable(formData, 'client_id'),
-      str(formData, 'type') || 'rent_reminder',
-      nullable(formData, 'subject'),
-      nullable(formData, 'message'),
-      str(formData, 'scheduled_date'),
-      str(formData, 'status') || 'pending',
-      str(formData, 'channel') || 'email',
-      id,
-      user.org_id
-    );
+  const { error } = await supabase
+    .from('reminders')
+    .update({
+      invoice_id: nullable(formData, 'invoice_id'),
+      client_id: nullable(formData, 'client_id'),
+      type: str(formData, 'type') || 'rent_reminder',
+      subject: nullable(formData, 'subject'),
+      message: nullable(formData, 'message'),
+      scheduled_date: str(formData, 'scheduled_date'),
+      status: str(formData, 'status') || 'pending',
+      channel: str(formData, 'channel') || 'email',
+    })
+    .eq('id', id)
+    .eq('organization_id', user.org_id);
 
-  logActivity(user.org_id, user.id, 'Relance modifiée', str(formData, 'subject') || 'Relance');
+  if (error) return { ok: false, error: GENERIC_ERROR };
+
+  await logActivity(supabase, user, 'Relance modifiée', str(formData, 'subject') || 'Relance');
   refresh(['/reminders', '/dashboard']);
   return { ok: true, message: 'La relance a été mise à jour.' };
 }
@@ -560,25 +577,33 @@ export async function updateReminder(formData: FormData): Promise<ActionState> {
 /** Marque une relance comme envoyée (action rapide). */
 export async function sendReminder(formData: FormData): Promise<ActionState> {
   const user = await requireUser();
+  const supabase = createServerSupabase();
   const id = str(formData, 'id');
   if (!id) return { ok: false, error: 'Identifiant manquant.' };
 
-  getDb()
-    .prepare(`UPDATE reminders SET status = 'sent', sent_at = ? WHERE id = ? AND org_id = ?`)
-    .run(new Date().toISOString(), id, user.org_id);
+  const { error } = await supabase
+    .from('reminders')
+    .update({ status: 'sent', sent_at: new Date().toISOString() })
+    .eq('id', id)
+    .eq('organization_id', user.org_id);
 
-  logActivity(user.org_id, user.id, 'Relance envoyée', str(formData, 'subject') || 'Relance');
+  if (error) return { ok: false, error: GENERIC_ERROR };
+
+  await logActivity(supabase, user, 'Relance envoyée', str(formData, 'subject') || 'Relance');
   refresh(['/reminders', '/dashboard']);
   return { ok: true, message: 'La relance a été marquée comme envoyée.' };
 }
 
 export async function deleteReminder(formData: FormData): Promise<ActionState> {
   const user = await requireUser();
+  const supabase = createServerSupabase();
   const id = str(formData, 'id');
   if (!id) return { ok: false, error: 'Identifiant manquant.' };
 
-  getDb().prepare('DELETE FROM reminders WHERE id = ? AND org_id = ?').run(id, user.org_id);
-  logActivity(user.org_id, user.id, 'Relance supprimée', str(formData, 'subject') || 'Relance');
+  const { error } = await supabase.from('reminders').delete().eq('id', id).eq('organization_id', user.org_id);
+  if (error) return { ok: false, error: GENERIC_ERROR };
+
+  await logActivity(supabase, user, 'Relance supprimée', str(formData, 'subject') || 'Relance');
   refresh(['/reminders', '/dashboard']);
   return { ok: true, message: 'La relance a été supprimée.' };
 }
@@ -589,89 +614,88 @@ export async function deleteReminder(formData: FormData): Promise<ActionState> {
 
 export async function createRecoveryCase(formData: FormData): Promise<ActionState> {
   const user = await requireUser();
+  const supabase = createServerSupabase();
   const invoiceId = str(formData, 'invoice_id');
   if (!invoiceId) return { ok: false, error: 'Sélectionnez une facture impayée.' };
 
-  const db = getDb();
-  const invoice = db
-    .prepare(
-      `SELECT i.id, i.amount, i.client_id, i.property_id, i.invoice_number
-       FROM invoices i WHERE i.id = ? AND i.org_id = ?`
-    )
-    .get(invoiceId, user.org_id) as
-    | { id: string; amount: number; client_id: string | null; property_id: string | null; invoice_number: string }
-    | undefined;
+  const { data: invoice } = await supabase
+    .from('invoices')
+    .select('id, amount, client_id, property_id, invoice_number')
+    .eq('id', invoiceId)
+    .eq('organization_id', user.org_id)
+    .maybeSingle();
 
   if (!invoice) return { ok: false, error: 'Facture introuvable.' };
 
-  const already = db
-    .prepare(`SELECT id FROM recovery_cases WHERE invoice_id = ? AND status NOT IN ('resolved','closed','waived')`)
-    .get(invoiceId);
-  if (already) return { ok: false, error: 'Un dossier de recouvrement est déjà ouvert pour cette facture.' };
+  const { data: existing } = await supabase
+    .from('recovery_cases')
+    .select('id')
+    .eq('invoice_id', invoiceId)
+    .not('status', 'in', '("resolved","closed","waived")')
+    .maybeSingle();
 
-  const reference = nextReference(user.org_id, 'recovery_cases', 'REC');
+  if (existing) return { ok: false, error: 'Un dossier de recouvrement est déjà ouvert pour cette facture.' };
 
-  db.prepare(
-    `INSERT INTO recovery_cases (id, org_id, reference, invoice_id, client_id, property_id, amount_due, opened_at, status, assigned_to, resolution, notes, closure_date, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    randomUUID(),
-    user.org_id,
+  const reference = await nextReference(supabase, user.org_id, 'recovery_cases', 'REC');
+
+  const { error } = await supabase.from('recovery_cases').insert({
+    organization_id: user.org_id,
     reference,
-    invoiceId,
-    invoice.client_id,
-    invoice.property_id,
-    num(formData, 'amount_due') || invoice.amount,
-    new Date().toISOString(),
-    str(formData, 'status') || 'open',
-    nullable(formData, 'assigned_to') ?? user.full_name,
-    null,
-    nullable(formData, 'notes'),
-    null,
-    new Date().toISOString()
-  );
+    invoice_id: invoiceId,
+    client_id: invoice.client_id,
+    property_id: invoice.property_id,
+    amount_due: num(formData, 'amount_due') || Number(invoice.amount),
+    status: str(formData, 'status') || 'open',
+    assigned_to: nullable(formData, 'assigned_to') ?? user.full_name,
+    notes: nullable(formData, 'notes'),
+  });
 
-  logActivity(user.org_id, user.id, 'Dossier de recouvrement ouvert', `${reference} — ${invoice.invoice_number}`);
+  if (error) return { ok: false, error: GENERIC_ERROR };
+
+  await logActivity(supabase, user, 'Dossier de recouvrement ouvert', `${reference} — ${invoice.invoice_number}`);
   refresh(['/recovery', '/dashboard']);
   return { ok: true, message: `Le dossier ${reference} a été ouvert.` };
 }
 
 export async function updateRecoveryCase(formData: FormData): Promise<ActionState> {
   const user = await requireUser();
+  const supabase = createServerSupabase();
   const id = str(formData, 'id');
   if (!id) return { ok: false, error: 'Identifiant manquant.' };
 
   const status = str(formData, 'status') || 'open';
   const closed = ['resolved', 'closed', 'waived'].includes(status);
 
-  getDb()
-    .prepare(
-      `UPDATE recovery_cases SET amount_due = ?, status = ?, assigned_to = ?, resolution = ?, notes = ?, closure_date = ?
-       WHERE id = ? AND org_id = ?`
-    )
-    .run(
-      num(formData, 'amount_due'),
+  const { error } = await supabase
+    .from('recovery_cases')
+    .update({
+      amount_due: num(formData, 'amount_due'),
       status,
-      nullable(formData, 'assigned_to'),
-      nullable(formData, 'resolution'),
-      nullable(formData, 'notes'),
-      closed ? new Date().toISOString().slice(0, 10) : null,
-      id,
-      user.org_id
-    );
+      assigned_to: nullable(formData, 'assigned_to'),
+      resolution: nullable(formData, 'resolution'),
+      notes: nullable(formData, 'notes'),
+      closure_date: closed ? new Date().toISOString().slice(0, 10) : null,
+    })
+    .eq('id', id)
+    .eq('organization_id', user.org_id);
 
-  logActivity(user.org_id, user.id, 'Dossier de recouvrement mis à jour', str(formData, 'reference'));
+  if (error) return { ok: false, error: GENERIC_ERROR };
+
+  await logActivity(supabase, user, 'Dossier de recouvrement mis à jour', str(formData, 'reference'));
   refresh(['/recovery', '/dashboard']);
   return { ok: true, message: 'Le dossier a été mis à jour.' };
 }
 
 export async function deleteRecoveryCase(formData: FormData): Promise<ActionState> {
   const user = await requireUser();
+  const supabase = createServerSupabase();
   const id = str(formData, 'id');
   if (!id) return { ok: false, error: 'Identifiant manquant.' };
 
-  getDb().prepare('DELETE FROM recovery_cases WHERE id = ? AND org_id = ?').run(id, user.org_id);
-  logActivity(user.org_id, user.id, 'Dossier de recouvrement supprimé', str(formData, 'reference'));
+  const { error } = await supabase.from('recovery_cases').delete().eq('id', id).eq('organization_id', user.org_id);
+  if (error) return { ok: false, error: GENERIC_ERROR };
+
+  await logActivity(supabase, user, 'Dossier de recouvrement supprimé', str(formData, 'reference'));
   refresh(['/recovery', '/dashboard']);
   return { ok: true, message: 'Le dossier a été supprimé.' };
 }
@@ -682,32 +706,38 @@ export async function deleteRecoveryCase(formData: FormData): Promise<ActionStat
 
 export async function updateOrganization(formData: FormData): Promise<ActionState> {
   const user = await requireUser();
+  const supabase = createServerSupabase();
   const name = str(formData, 'name');
   if (!name) return { ok: false, error: "Le nom de l'entreprise est requis." };
 
-  getDb()
-    .prepare('UPDATE organizations SET name = ?, address = ?, email = ?, phone = ? WHERE id = ?')
-    .run(
+  const { error } = await supabase
+    .from('organizations')
+    .update({
       name,
-      nullable(formData, 'address'),
-      nullable(formData, 'email'),
-      nullable(formData, 'phone'),
-      user.org_id
-    );
+      address: nullable(formData, 'address'),
+      email: nullable(formData, 'email'),
+      phone: nullable(formData, 'phone'),
+    })
+    .eq('id', user.org_id);
 
-  logActivity(user.org_id, user.id, 'Organisation modifiée', name);
+  if (error) return { ok: false, error: GENERIC_ERROR };
+
+  await logActivity(supabase, user, 'Organisation modifiée', name);
   refresh(['/settings', '/dashboard']);
   return { ok: true, message: 'Les informations ont été enregistrées.' };
 }
 
 export async function updateSubscription(formData: FormData): Promise<ActionState> {
   const user = await requireUser();
+  const supabase = createServerSupabase();
   const plan = str(formData, 'plan');
   const allowed = ['free', 'basic', 'pro', 'enterprise'];
   if (!allowed.includes(plan)) return { ok: false, error: 'Plan invalide.' };
 
-  getDb().prepare('UPDATE organizations SET plan = ? WHERE id = ?').run(plan, user.org_id);
-  logActivity(user.org_id, user.id, 'Changement de plan', `Nouveau plan : ${plan}`);
+  const { error } = await supabase.from('organizations').update({ plan }).eq('id', user.org_id);
+  if (error) return { ok: false, error: GENERIC_ERROR };
+
+  await logActivity(supabase, user, 'Changement de plan', `Nouveau plan : ${plan}`);
   refresh(['/settings']);
   return { ok: true, message: `Le plan a été changé pour « ${plan} ».` };
 }
@@ -724,25 +754,66 @@ export async function createUser(formData: FormData): Promise<ActionState> {
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return { ok: false, error: 'Adresse email invalide.' };
   if (password.length < 8) return { ok: false, error: 'Le mot de passe doit contenir au moins 8 caractères.' };
 
-  const db = getDb();
-  const existing = db.prepare('SELECT id FROM users WHERE lower(email) = lower(?)').get(email);
-  if (existing) return { ok: false, error: 'Un utilisateur existe déjà avec cet email.' };
+  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!serviceKey) {
+    return {
+      ok: false,
+      error:
+        "L'invitation d'utilisateur nécessite la clé « service_role » du projet. Ajoutez SUPABASE_SERVICE_ROLE_KEY dans .env.local.",
+    };
+  }
 
-  db.prepare(
-    `INSERT INTO users (id, org_id, email, full_name, password_hash, role, enabled, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    randomUUID(),
-    user.org_id,
+  const supabase = createServerSupabase();
+
+  // L'utilisateur est créé via l'API d'administration ; le trigger lui crée
+  // une organisation, que l'on remplace ensuite par celle de l'invitant.
+  const { createClient: createAdminClient } = await import('@supabase/supabase-js');
+  const admin = createAdminClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, serviceKey, {
+    auth: { autoRefreshToken: false, persistSession: false },
+  });
+
+  const { data: created, error: createError } = await admin.auth.admin.createUser({
     email,
-    fullName,
-    hashPassword(password),
-    str(formData, 'role') || 'agent',
-    1,
-    new Date().toISOString()
-  );
+    password,
+    email_confirm: true,
+    user_metadata: { organization_name: user.org_name, full_name: fullName },
+  });
 
-  logActivity(user.org_id, user.id, 'Utilisateur invité', `${fullName} (${email})`);
+  if (createError) {
+    const m = createError.message.toLowerCase();
+    if (m.includes('already') || m.includes('registered') || m.includes('exists')) {
+      return { ok: false, error: 'Un utilisateur existe déjà avec cet email.' };
+    }
+    return { ok: false, error: GENERIC_ERROR };
+  }
+
+  const newId = created.user?.id;
+
+  if (newId) {
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('organization_id')
+      .eq('id', newId)
+      .maybeSingle();
+
+    await admin
+      .from('profiles')
+      .update({
+        organization_id: user.org_id,
+        full_name: fullName,
+        role: str(formData, 'role') || 'agent',
+      })
+      .eq('id', newId);
+
+    // Supprime l'organisation créée en trop par le trigger d'inscription.
+    const orphan = profile?.organization_id as string | undefined;
+    if (orphan && orphan !== user.org_id) {
+      await admin.from('activity_log').delete().eq('organization_id', orphan);
+      await admin.from('organizations').delete().eq('id', orphan);
+    }
+  }
+
+  await logActivity(supabase, user, 'Utilisateur invité', `${fullName} (${email})`);
   refresh(['/settings']);
   return { ok: true, message: `L'utilisateur « ${fullName} » a été créé.` };
 }
@@ -755,19 +826,28 @@ export async function toggleUser(formData: FormData): Promise<ActionState> {
   if (!id) return { ok: false, error: 'Identifiant manquant.' };
   if (id === user.id) return { ok: false, error: 'Vous ne pouvez pas désactiver votre propre compte.' };
 
-  const db = getDb();
-  const target = db.prepare('SELECT enabled, full_name FROM users WHERE id = ? AND org_id = ?').get(id, user.org_id) as
-    | { enabled: number; full_name: string }
-    | undefined;
+  const supabase = createServerSupabase();
+  const { data: target } = await supabase
+    .from('profiles')
+    .select('enabled, full_name')
+    .eq('id', id)
+    .eq('organization_id', user.org_id)
+    .maybeSingle();
+
   if (!target) return { ok: false, error: 'Utilisateur introuvable.' };
 
-  const next = target.enabled === 1 ? 0 : 1;
-  db.prepare('UPDATE users SET enabled = ? WHERE id = ? AND org_id = ?').run(next, id, user.org_id);
-  if (next === 0) db.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
+  const next = !target.enabled;
+  const { error } = await supabase
+    .from('profiles')
+    .update({ enabled: next })
+    .eq('id', id)
+    .eq('organization_id', user.org_id);
 
-  logActivity(user.org_id, user.id, next === 1 ? 'Utilisateur activé' : 'Utilisateur désactivé', target.full_name);
+  if (error) return { ok: false, error: GENERIC_ERROR };
+
+  await logActivity(supabase, user, next ? 'Utilisateur activé' : 'Utilisateur désactivé', target.full_name as string);
   refresh(['/settings']);
-  return { ok: true, message: next === 1 ? 'Utilisateur activé.' : 'Utilisateur désactivé.' };
+  return { ok: true, message: next ? 'Utilisateur activé.' : 'Utilisateur désactivé.' };
 }
 
 export async function updateUser(formData: FormData): Promise<ActionState> {
@@ -778,11 +858,16 @@ export async function updateUser(formData: FormData): Promise<ActionState> {
   const fullName = str(formData, 'full_name');
   if (!id || !fullName) return { ok: false, error: 'Données incomplètes.' };
 
-  getDb()
-    .prepare('UPDATE users SET full_name = ?, role = ? WHERE id = ? AND org_id = ?')
-    .run(fullName, str(formData, 'role') || 'agent', id, user.org_id);
+  const supabase = createServerSupabase();
+  const { error } = await supabase
+    .from('profiles')
+    .update({ full_name: fullName, role: str(formData, 'role') || 'agent' })
+    .eq('id', id)
+    .eq('organization_id', user.org_id);
 
-  logActivity(user.org_id, user.id, 'Utilisateur modifié', fullName);
+  if (error) return { ok: false, error: GENERIC_ERROR };
+
+  await logActivity(supabase, user, 'Utilisateur modifié', fullName);
   refresh(['/settings']);
   return { ok: true, message: 'Utilisateur mis à jour.' };
 }
@@ -792,7 +877,10 @@ export async function updateProfile(formData: FormData): Promise<ActionState> {
   const fullName = str(formData, 'full_name');
   if (!fullName) return { ok: false, error: 'Le nom est requis.' };
 
-  getDb().prepare('UPDATE users SET full_name = ? WHERE id = ?').run(fullName, user.id);
+  const supabase = createServerSupabase();
+  const { error } = await supabase.from('profiles').update({ full_name: fullName }).eq('id', user.id);
+  if (error) return { ok: false, error: GENERIC_ERROR };
+
   refresh(['/settings', '/dashboard']);
   return { ok: true, message: 'Votre profil a été mis à jour.' };
 }
@@ -806,15 +894,18 @@ export async function changePassword(formData: FormData): Promise<ActionState> {
   if (next.length < 8) return { ok: false, error: 'Le nouveau mot de passe doit contenir au moins 8 caractères.' };
   if (next !== confirm) return { ok: false, error: 'Les mots de passe ne correspondent pas.' };
 
-  const row = getDb().prepare('SELECT password_hash FROM users WHERE id = ?').get(user.id) as
-    | { password_hash: string }
-    | undefined;
+  const supabase = createServerSupabase();
 
-  if (!row || !verifyPassword(current, row.password_hash)) {
-    return { ok: false, error: 'Le mot de passe actuel est incorrect.' };
-  }
+  // Vérifie le mot de passe actuel en tentant une reconnexion.
+  const { error: verifyError } = await supabase.auth.signInWithPassword({
+    email: user.email,
+    password: current,
+  });
+  if (verifyError) return { ok: false, error: 'Le mot de passe actuel est incorrect.' };
 
-  getDb().prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hashPassword(next), user.id);
+  const { error } = await supabase.auth.updateUser({ password: next });
+  if (error) return { ok: false, error: GENERIC_ERROR };
+
   refresh(['/settings']);
   return { ok: true, message: 'Votre mot de passe a été modifié.' };
 }

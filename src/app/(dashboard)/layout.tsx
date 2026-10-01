@@ -3,8 +3,8 @@ import { Sidebar } from '@/components/Sidebar';
 import { getSession } from '@/lib/auth';
 import { logoutAction } from '@/app/actions';
 
-export default function DashboardLayout({ children }: { children: React.ReactNode }) {
-  const user = getSession();
+export default async function DashboardLayout({ children }: { children: React.ReactNode }) {
+  const user = await getSession();
   if (!user) redirect('/login');
 
   return (

@@ -6,8 +6,8 @@ import { ActionForm, SubmitButton } from '@/components/ui/ActionForm';
 
 export const metadata = { title: 'Créer un compte — IMMO SAAS' };
 
-export default function RegisterPage() {
-  if (getSession()) redirect('/dashboard');
+export default async function RegisterPage() {
+  if (await getSession()) redirect('/dashboard');
 
   return (
     <div className="min-h-screen bg-navy-50 flex items-center justify-center p-4 py-10">

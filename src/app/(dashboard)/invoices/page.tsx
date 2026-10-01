@@ -1,49 +1,80 @@
 import { redirect } from 'next/navigation';
 import { getSession } from '@/lib/auth';
-import { getDb } from '@/lib/db';
+import { createServerSupabase } from '@/lib/supabase';
 import { InvoicesClient } from './InvoicesClient';
 import type { Client, InvoiceWithRelations, Lease, Payment, Property } from '@/lib/types';
 
 export const metadata = { title: 'Factures — IMMO SAAS' };
 
-export default function InvoicesPage() {
-  const user = getSession();
+export default async function InvoicesPage() {
+  const user = await getSession();
   if (!user) redirect('/login');
-  const db = getDb();
 
-  const invoices = db
-    .prepare(
-      `SELECT i.*, c.full_name AS client_name, p.name AS property_name, l.reference AS lease_reference,
-              (SELECT COALESCE(SUM(amount), 0) FROM payments WHERE invoice_id = i.id) AS paid_total
-       FROM invoices i
-       LEFT JOIN clients c ON c.id = i.client_id
-       LEFT JOIN properties p ON p.id = i.property_id
-       LEFT JOIN leases l ON l.id = i.lease_id
-       WHERE i.org_id = ?
-       ORDER BY i.created_at DESC, i.due_date DESC`
-    )
-    .all(user.org_id) as InvoiceWithRelations[];
+  const supabase = createServerSupabase();
 
-  const properties = db
-    .prepare('SELECT * FROM properties WHERE org_id = ? ORDER BY name ASC')
-    .all(user.org_id) as Property[];
+  const [{ data: invoices }, { data: properties }, { data: clients }, { data: leases }, { data: payments }] =
+    await Promise.all([
+      supabase
+        .from('invoices')
+        .select('*, clients(full_name), properties(name), leases(reference), payments(amount)')
+        .eq('organization_id', user.org_id)
+        .order('created_at', { ascending: false }),
+      supabase.from('properties').select('*').eq('organization_id', user.org_id).order('name', { ascending: true }),
+      supabase.from('clients').select('*').eq('organization_id', user.org_id).order('full_name', { ascending: true }),
+      supabase
+        .from('leases')
+        .select('*, clients(full_name), properties(name)')
+        .eq('organization_id', user.org_id)
+        .in('status', ['active', 'pending'])
+        .order('created_at', { ascending: false }),
+      supabase
+        .from('payments')
+        .select('*')
+        .eq('organization_id', user.org_id)
+        .order('payment_date', { ascending: false })
+        .limit(50),
+    ]);
 
-  const clients = db.prepare('SELECT * FROM clients WHERE org_id = ? ORDER BY full_name ASC').all(user.org_id) as Client[];
+  const shapedInvoices = (invoices ?? []).map((row) => {
+    const r = row as Record<string, unknown> & {
+      clients?: unknown;
+      properties?: unknown;
+      leases?: unknown;
+      payments?: unknown;
+    };
+    const cli = Array.isArray(r.clients) ? r.clients[0] : r.clients;
+    const prop = Array.isArray(r.properties) ? r.properties[0] : r.properties;
+    const lea = Array.isArray(r.leases) ? r.leases[0] : r.leases;
+    const pays = Array.isArray(r.payments) ? r.payments : [];
+    const { clients: _c, properties: _p, leases: _l, payments: _pay, ...rest } = r;
+    return {
+      ...rest,
+      client_name: (cli as { full_name?: string } | null)?.full_name ?? null,
+      property_name: (prop as { name?: string } | null)?.name ?? null,
+      lease_reference: (lea as { reference?: string } | null)?.reference ?? null,
+      paid_total: (pays as { amount: number | null }[]).reduce((sum, p) => sum + Number(p.amount ?? 0), 0),
+    };
+  }) as unknown as InvoiceWithRelations[];
 
-  const leases = db
-    .prepare(
-      `SELECT l.*, c.full_name AS client_name, p.name AS property_name
-       FROM leases l
-       LEFT JOIN clients c ON c.id = l.client_id
-       LEFT JOIN properties p ON p.id = l.property_id
-       WHERE l.org_id = ? AND l.status IN ('active','pending')
-       ORDER BY l.created_at DESC`
-    )
-    .all(user.org_id) as (Lease & { client_name: string | null; property_name: string | null })[];
+  const shapedLeases = (leases ?? []).map((row) => {
+    const r = row as Record<string, unknown> & { clients?: unknown; properties?: unknown };
+    const cli = Array.isArray(r.clients) ? r.clients[0] : r.clients;
+    const prop = Array.isArray(r.properties) ? r.properties[0] : r.properties;
+    const { clients: _c, properties: _p, ...rest } = r;
+    return {
+      ...rest,
+      client_name: (cli as { full_name?: string } | null)?.full_name ?? null,
+      property_name: (prop as { name?: string } | null)?.name ?? null,
+    };
+  }) as unknown as (Lease & { client_name: string | null; property_name: string | null })[];
 
-  const payments = db
-    .prepare('SELECT * FROM payments WHERE org_id = ? ORDER BY payment_date DESC, created_at DESC LIMIT 50')
-    .all(user.org_id) as Payment[];
-
-  return <InvoicesClient invoices={invoices} properties={properties} clients={clients} leases={leases} payments={payments} />;
+  return (
+    <InvoicesClient
+      invoices={shapedInvoices}
+      properties={(properties ?? []) as Property[]}
+      clients={(clients ?? []) as Client[]}
+      leases={shapedLeases}
+      payments={(payments ?? []) as Payment[]}
+    />
+  );
 }

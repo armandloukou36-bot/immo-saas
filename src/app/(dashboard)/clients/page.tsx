@@ -1,25 +1,32 @@
 import { redirect } from 'next/navigation';
 import { getSession } from '@/lib/auth';
-import { all } from '@/lib/db';
+import { createServerSupabase } from '@/lib/supabase';
 import { ClientsClient } from './ClientsClient';
 import type { ClientWithProperty, Property } from '@/lib/types';
 
 export const metadata = { title: 'Clients — IMMO SAAS' };
 
-export default function ClientsPage() {
-  const user = getSession();
+export default async function ClientsPage() {
+  const user = await getSession();
   if (!user) redirect('/login');
 
-  const clients = all<ClientWithProperty>(
-    `SELECT c.*, p.name AS property_name
-       FROM clients c
-       LEFT JOIN properties p ON p.id = c.property_id
-       WHERE c.org_id = ?
-       ORDER BY c.created_at DESC`,
-    user.org_id
-  );
+  const supabase = createServerSupabase();
 
-  const properties = all<Property>('SELECT * FROM properties WHERE org_id = ? ORDER BY name ASC', user.org_id);
+  const [{ data: clients }, { data: properties }] = await Promise.all([
+    supabase
+      .from('clients')
+      .select('*, properties(name)')
+      .eq('organization_id', user.org_id)
+      .order('created_at', { ascending: false }),
+    supabase.from('properties').select('*').eq('organization_id', user.org_id).order('name', { ascending: true }),
+  ]);
 
-  return <ClientsClient clients={clients} properties={properties} />;
+  // Aplatit la relation « properties(name) » en property_name.
+  const shaped = (clients ?? []).map((row) => {
+    const rel = Array.isArray(row.properties) ? row.properties[0] : row.properties;
+    const { properties: _drop, ...rest } = row as Record<string, unknown> & { properties?: unknown };
+    return { ...rest, property_name: (rel as { name?: string } | null)?.name ?? null };
+  }) as unknown as ClientWithProperty[];
+
+  return <ClientsClient clients={shaped} properties={(properties ?? []) as Property[]} />;
 }

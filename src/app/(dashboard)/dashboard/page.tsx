@@ -1,6 +1,6 @@
 import { redirect } from 'next/navigation';
 import { getSession } from '@/lib/auth';
-import { getDb } from '@/lib/db';
+import { createServerSupabase } from '@/lib/supabase';
 import { formatFCFA, formatDate, timeAgo } from '@/lib/format';
 import { INVOICE_STATUS, StatusBadge, statusOf } from '@/components/ui/StatusBadge';
 import type { InvoiceWithRelations } from '@/lib/types';
@@ -24,61 +24,142 @@ type Stats = {
 
 type Activity = { id: string; action: string; detail: string | null; created_at: string };
 
-export default function DashboardPage() {
-  const user = getSession();
+/** Compte les lignes d'une table pour l'organisation, avec un filtre optionnel. */
+async function countRows(
+  supabase: ReturnType<typeof createServerSupabase>,
+  table: 'properties' | 'clients' | 'leases',
+  orgId: string,
+  filters?: Record<string, string>
+): Promise<number> {
+  let query = supabase.from(table).select('id', { count: 'exact', head: true }).eq('organization_id', orgId);
+  if (filters) {
+    for (const [column, value] of Object.entries(filters)) {
+      query = query.eq(column, value);
+    }
+  }
+  const { count: n } = await query;
+  return n ?? 0;
+}
+
+function sumAmount(rows: { amount?: number | null; amount_due?: number | null }[] | null, key: 'amount' | 'amount_due') {
+  return (rows ?? []).reduce((s, r) => s + Number(r[key] ?? 0), 0);
+}
+
+export default async function DashboardPage() {
+  const user = await getSession();
   if (!user) redirect('/login');
+
   const orgId = user.org_id;
-  const db = getDb();
+  const supabase = createServerSupabase();
 
-  const stats = db
-    .prepare(
-      `SELECT
-        (SELECT COUNT(*) FROM properties WHERE org_id = ?) AS total_properties,
-        (SELECT COUNT(*) FROM properties WHERE org_id = ? AND status = 'disponible') AS available_properties,
-        (SELECT COUNT(*) FROM properties WHERE org_id = ? AND status = 'loué') AS leased_properties,
-        (SELECT COUNT(*) FROM clients WHERE org_id = ?) AS total_clients,
-        (SELECT COUNT(*) FROM leases WHERE org_id = ? AND status = 'active') AS active_leases,
-        (SELECT COUNT(*) FROM invoices WHERE org_id = ? AND status = 'pending') AS pending_invoices,
-        (SELECT COUNT(*) FROM invoices WHERE org_id = ? AND status = 'overdue') AS overdue_invoices,
-        (SELECT COALESCE(SUM(amount), 0) FROM invoices WHERE org_id = ? AND status = 'pending') AS pending_amount,
-        (SELECT COALESCE(SUM(amount), 0) FROM invoices WHERE org_id = ? AND status = 'overdue') AS overdue_amount,
-        (SELECT COUNT(*) FROM recovery_cases WHERE org_id = ? AND status IN ('open','investigating','notice_sent','legal_action')) AS open_recovery_cases,
-        (SELECT COALESCE(SUM(amount_due), 0) FROM recovery_cases WHERE org_id = ? AND status NOT IN ('resolved','closed','waived')) AS recovery_amount,
-        (SELECT COUNT(*) FROM invoices WHERE org_id = ? AND status = 'paid' AND substr(paid_date, 1, 7) = substr(date('now'), 1, 7)) AS paid_this_month,
-        (SELECT COALESCE(SUM(amount), 0) FROM invoices WHERE org_id = ? AND status = 'paid' AND substr(paid_date, 1, 7) = substr(date('now'), 1, 7)) AS revenue_this_month`
-    )
-    .get(orgId, orgId, orgId, orgId, orgId, orgId, orgId, orgId, orgId, orgId, orgId, orgId, orgId) as Stats;
+  const monthStart = new Date();
+  monthStart.setDate(1);
+  const monthStartStr = monthStart.toISOString().slice(0, 10);
 
-  const recentInvoices = db
-    .prepare(
-      `SELECT i.*, c.full_name AS client_name, p.name AS property_name, l.reference AS lease_reference,
-              (SELECT COALESCE(SUM(amount), 0) FROM payments WHERE invoice_id = i.id) AS paid_total
-       FROM invoices i
-       LEFT JOIN clients c ON c.id = i.client_id
-       LEFT JOIN properties p ON p.id = i.property_id
-       LEFT JOIN leases l ON l.id = i.lease_id
-       WHERE i.org_id = ?
-       ORDER BY i.created_at DESC, i.due_date DESC
-       LIMIT 5`
-    )
-    .all(orgId) as InvoiceWithRelations[];
+  const [
+    totalProperties,
+    availableProperties,
+    leasedProperties,
+    totalClients,
+    activeLeases,
+    pendingRows,
+    overdueRows,
+    openRecoveryRows,
+    paidThisMonthRows,
+    recentInvoicesRes,
+    activityRes,
+    upcomingRes,
+  ] = await Promise.all([
+    countRows(supabase, 'properties', orgId),
+    countRows(supabase, 'properties', orgId, { status: 'disponible' }),
+    countRows(supabase, 'properties', orgId, { status: 'loué' }),
+    countRows(supabase, 'clients', orgId),
+    countRows(supabase, 'leases', orgId, { status: 'active' }),
+    supabase.from('invoices').select('amount').eq('organization_id', orgId).eq('status', 'pending'),
+    supabase.from('invoices').select('amount').eq('organization_id', orgId).eq('status', 'overdue'),
+    supabase
+      .from('recovery_cases')
+      .select('amount_due')
+      .eq('organization_id', orgId)
+      .in('status', ['open', 'investigating', 'notice_sent', 'legal_action']),
+    supabase
+      .from('invoices')
+      .select('amount')
+      .eq('organization_id', orgId)
+      .eq('status', 'paid')
+      .gte('paid_date', monthStartStr),
+    supabase
+      .from('invoices')
+      .select('*, clients(full_name), properties(name), leases(reference), payments(amount)')
+      .eq('organization_id', orgId)
+      .order('created_at', { ascending: false })
+      .limit(5),
+    supabase
+      .from('activity_log')
+      .select('id, action, detail, created_at')
+      .eq('organization_id', orgId)
+      .order('created_at', { ascending: false })
+      .limit(6),
+    supabase
+      .from('leases')
+      .select('reference, end_date, properties(name), clients(full_name)')
+      .eq('organization_id', orgId)
+      .eq('status', 'active')
+      .not('end_date', 'is', null)
+      .order('end_date', { ascending: true })
+      .limit(3),
+  ]);
 
-  const activity = db
-    .prepare('SELECT id, action, detail, created_at FROM activity_log WHERE org_id = ? ORDER BY created_at DESC LIMIT 6')
-    .all(orgId) as Activity[];
+  const stats: Stats = {
+    total_properties: totalProperties,
+    available_properties: availableProperties,
+    leased_properties: leasedProperties,
+    total_clients: totalClients,
+    active_leases: activeLeases,
+    pending_invoices: pendingRows.data?.length ?? 0,
+    overdue_invoices: overdueRows.data?.length ?? 0,
+    pending_amount: sumAmount(pendingRows.data, 'amount'),
+    overdue_amount: sumAmount(overdueRows.data, 'amount'),
+    open_recovery_cases: openRecoveryRows.data?.length ?? 0,
+    recovery_amount: sumAmount(openRecoveryRows.data, 'amount_due'),
+    paid_this_month: paidThisMonthRows.data?.length ?? 0,
+    revenue_this_month: sumAmount(paidThisMonthRows.data, 'amount'),
+  };
 
-  const upcomingLeases = db
-    .prepare(
-      `SELECT l.reference, l.end_date, p.name AS property_name, c.full_name AS client_name
-       FROM leases l
-       LEFT JOIN properties p ON p.id = l.property_id
-       LEFT JOIN clients c ON c.id = l.client_id
-       WHERE l.org_id = ? AND l.status = 'active' AND l.end_date IS NOT NULL
-         AND julianday(l.end_date) - julianday('now') BETWEEN 0 AND 90
-       ORDER BY l.end_date ASC
-       LIMIT 3`
-    )
-    .all(orgId) as { reference: string; end_date: string; property_name: string | null; client_name: string | null }[];
+  const recentInvoices = (recentInvoicesRes.data ?? []).map((row) => {
+    const r = row as Record<string, unknown> & {
+      clients?: unknown;
+      properties?: unknown;
+      leases?: unknown;
+      payments?: unknown;
+    };
+    const cli = Array.isArray(r.clients) ? r.clients[0] : r.clients;
+    const prop = Array.isArray(r.properties) ? r.properties[0] : r.properties;
+    const lea = Array.isArray(r.leases) ? r.leases[0] : r.leases;
+    const pays = Array.isArray(r.payments) ? r.payments : [];
+    const { clients: _c, properties: _p, leases: _l, payments: _pay, ...rest } = r;
+    return {
+      ...rest,
+      client_name: (cli as { full_name?: string } | null)?.full_name ?? null,
+      property_name: (prop as { name?: string } | null)?.name ?? null,
+      lease_reference: (lea as { reference?: string } | null)?.reference ?? null,
+      paid_total: (pays as { amount: number | null }[]).reduce((s, p) => s + Number(p.amount ?? 0), 0),
+    };
+  }) as unknown as InvoiceWithRelations[];
+
+  const activity = (activityRes.data ?? []) as Activity[];
+
+  const upcomingLeases = (upcomingRes.data ?? []).map((row) => {
+    const r = row as Record<string, unknown> & { properties?: unknown; clients?: unknown };
+    const prop = Array.isArray(r.properties) ? r.properties[0] : r.properties;
+    const cli = Array.isArray(r.clients) ? r.clients[0] : r.clients;
+    return {
+      reference: r.reference as string,
+      end_date: r.end_date as string,
+      property_name: (prop as { name?: string } | null)?.name ?? null,
+      client_name: (cli as { full_name?: string } | null)?.full_name ?? null,
+    };
+  });
 
   const collectionRate =
     stats.revenue_this_month + stats.overdue_amount > 0
@@ -226,7 +307,7 @@ export default function DashboardPage() {
             <p className="text-xs text-navy-600">
               {upcomingLeases.length > 0
                 ? `Prochain : ${upcomingLeases[0].property_name} — ${formatDate(upcomingLeases[0].end_date)}`
-                : 'Aucun renouvellement dans les 90 jours'}
+                : 'Aucun renouvellement à venir'}
             </p>
           </div>
 

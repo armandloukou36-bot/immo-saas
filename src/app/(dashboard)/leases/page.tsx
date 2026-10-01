@@ -1,34 +1,49 @@
 import { redirect } from 'next/navigation';
 import { getSession } from '@/lib/auth';
-import { getDb } from '@/lib/db';
+import { createServerSupabase } from '@/lib/supabase';
 import { LeasesClient } from './LeasesClient';
 import type { Client, LeaseWithRelations, Property } from '@/lib/types';
 
 export const metadata = { title: 'Baux — IMMO SAAS' };
 
-export default function LeasesPage() {
-  const user = getSession();
+export default async function LeasesPage() {
+  const user = await getSession();
   if (!user) redirect('/login');
-  const db = getDb();
 
-  const leases = db
-    .prepare(
-      `SELECT l.*, p.name AS property_name, c.full_name AS client_name
-       FROM leases l
-       LEFT JOIN properties p ON p.id = l.property_id
-       LEFT JOIN clients c ON c.id = l.client_id
-       WHERE l.org_id = ?
-       ORDER BY l.created_at DESC`
-    )
-    .all(user.org_id) as LeaseWithRelations[];
+  const supabase = createServerSupabase();
 
-  const properties = db
-    .prepare('SELECT * FROM properties WHERE org_id = ? ORDER BY name ASC')
-    .all(user.org_id) as Property[];
+  const [{ data: leases }, { data: properties }, { data: clients }] = await Promise.all([
+    supabase
+      .from('leases')
+      .select('*, properties(name), clients(full_name)')
+      .eq('organization_id', user.org_id)
+      .order('created_at', { ascending: false }),
+    supabase.from('properties').select('*').eq('organization_id', user.org_id).order('name', { ascending: true }),
+    supabase
+      .from('clients')
+      .select('*')
+      .eq('organization_id', user.org_id)
+      .in('type', ['locataire', 'prospect', 'vendeur', 'autre'])
+      .order('full_name', { ascending: true }),
+  ]);
 
-  const clients = db
-    .prepare(`SELECT * FROM clients WHERE org_id = ? AND type IN ('locataire','prospect','vendeur','autre') ORDER BY full_name ASC`)
-    .all(user.org_id) as Client[];
+  const shaped = (leases ?? []).map((row) => {
+    const r = row as Record<string, unknown> & { properties?: unknown; clients?: unknown };
+    const prop = Array.isArray(r.properties) ? r.properties[0] : r.properties;
+    const cli = Array.isArray(r.clients) ? r.clients[0] : r.clients;
+    const { properties: _p, clients: _c, ...rest } = r;
+    return {
+      ...rest,
+      property_name: (prop as { name?: string } | null)?.name ?? null,
+      client_name: (cli as { full_name?: string } | null)?.full_name ?? null,
+    };
+  }) as unknown as LeaseWithRelations[];
 
-  return <LeasesClient leases={leases} properties={properties} clients={clients} />;
+  return (
+    <LeasesClient
+      leases={shaped}
+      properties={(properties ?? []) as Property[]}
+      clients={(clients ?? []) as Client[]}
+    />
+  );
 }

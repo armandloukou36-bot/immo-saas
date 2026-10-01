@@ -1,10 +1,6 @@
 import 'server-only';
-import { cookies } from 'next/headers';
-import { randomBytes, randomUUID } from 'node:crypto';
-import { getDb, hashPassword, one, verifyPassword } from './db';
-
-const COOKIE = 'immo_session';
-const MAX_AGE = 60 * 60 * 24 * 7; // 7 jours
+import { redirect } from 'next/navigation';
+import { createServerSupabase } from './supabase';
 
 export type SessionUser = {
   id: string;
@@ -15,74 +11,49 @@ export type SessionUser = {
   org_name: string;
 };
 
-type UserRow = {
-  id: string;
-  org_id: string;
-  email: string;
-  full_name: string;
-  password_hash: string;
-  role: string;
-  enabled: number;
-};
+/* ------------------------------------------------------------------ */
+/* Lecture de la session                                               */
+/* ------------------------------------------------------------------ */
 
-/** Crée une session et pose le cookie. */
-export function createSession(userId: string): void {
-  const db = getDb();
-  const token = randomBytes(32).toString('hex');
-  const now = new Date();
-  const expires = new Date(now.getTime() + MAX_AGE * 1000);
+/**
+ * Retourne l'utilisateur connecté avec son organisation, ou null.
+ * `getUser()` valide le jeton auprès de Supabase, contrairement à
+ * `getSession()` qui se contente de lire le cookie.
+ */
+export async function getSession(): Promise<SessionUser | null> {
+  const supabase = createServerSupabase();
 
-  db.prepare('INSERT INTO sessions (token, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)').run(
-    token,
-    userId,
-    expires.toISOString(),
-    now.toISOString()
-  );
-  db.prepare('UPDATE users SET last_login_at = ? WHERE id = ?').run(now.toISOString(), userId);
-  db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(now.toISOString());
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
 
-  cookies().set(COOKIE, token, {
-    httpOnly: true,
-    sameSite: 'lax',
-    secure: process.env.NODE_ENV === 'production',
-    path: '/',
-    maxAge: MAX_AGE,
-  });
-}
+  if (!user) return null;
 
-/** Supprime la session courante. */
-export function destroySession(): void {
-  const token = cookies().get(COOKIE)?.value;
-  if (token) {
-    getDb().prepare('DELETE FROM sessions WHERE token = ?').run(token);
-  }
-  cookies().delete(COOKIE);
-}
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('organization_id, full_name, role, enabled, organizations(name)')
+    .eq('id', user.id)
+    .maybeSingle();
 
-/** Retourne l'utilisateur connecté, ou null. */
-export function getSession(): SessionUser | null {
-  const token = cookies().get(COOKIE)?.value;
-  if (!token) return null;
+  if (!profile || profile.enabled === false) return null;
 
-  const row = one<SessionUser & { enabled: number }>(
-    `SELECT u.id, u.org_id, u.email, u.full_name, u.role, u.enabled, o.name AS org_name
-     FROM sessions s
-     JOIN users u ON u.id = s.user_id
-     JOIN organizations o ON o.id = u.org_id
-     WHERE s.token = ? AND s.expires_at > ?`,
-    token,
-    new Date().toISOString()
-  );
+  const org = Array.isArray(profile.organizations) ? profile.organizations[0] : profile.organizations;
 
-  if (!row || row.enabled !== 1) return null;
   return {
-    id: row.id,
-    org_id: row.org_id,
-    email: row.email,
-    full_name: row.full_name,
-    role: row.role,
-    org_name: row.org_name,
+    id: user.id,
+    org_id: profile.organization_id as string,
+    email: user.email ?? '',
+    full_name: (profile.full_name as string) ?? user.email ?? '',
+    role: (profile.role as string) ?? 'agent',
+    org_name: (org?.name as string) ?? 'Mon organisation',
   };
+}
+
+/** Variante pour les Server Actions : redirige si non connecté. */
+export async function requireUser(): Promise<SessionUser> {
+  const user = await getSession();
+  if (!user) redirect('/login');
+  return user;
 }
 
 /* ------------------------------------------------------------------ */
@@ -91,85 +62,71 @@ export function getSession(): SessionUser | null {
 
 export type AuthResult = { ok: true } | { ok: false; error: string };
 
-export function login(email: string, password: string): AuthResult {
-  const db = getDb();
-  const user = one<UserRow>('SELECT * FROM users WHERE lower(email) = lower(?)', email.trim());
+/** Traduit les messages d'erreur Supabase en français. */
+function messageFor(raw: string): string {
+  const m = raw.toLowerCase();
+  if (m.includes('invalid login credentials')) return 'Email ou mot de passe incorrect.';
+  if (m.includes('email not confirmed')) return 'Votre email doit être confirmé avant de vous connecter.';
+  if (m.includes('already registered') || m.includes('already been registered'))
+    return 'Un compte existe déjà avec cet email.';
+  if (m.includes('password should be at least') || m.includes('password is too short'))
+    return 'Le mot de passe doit contenir au moins 8 caractères.';
+  if (m.includes('unable to validate email') || m.includes('invalid email')) return 'Adresse email invalide.';
+  if (m.includes('rate limit') || m.includes('too many')) return 'Trop de tentatives. Réessayez dans quelques minutes.';
+  if (m.includes('signups not allowed')) return 'Les inscriptions sont désactivées sur ce projet.';
+  return 'Une erreur est survenue. Veuillez réessayer.';
+}
 
-  if (!user || !verifyPassword(password, user.password_hash)) {
-    return { ok: false, error: 'Email ou mot de passe incorrect.' };
-  }
-  if (user.enabled !== 1) {
-    return { ok: false, error: 'Ce compte est désactivé.' };
+export async function login(email: string, password: string): Promise<AuthResult> {
+  const supabase = createServerSupabase();
+
+  const { error } = await supabase.auth.signInWithPassword({
+    email: email.trim(),
+    password,
+  });
+
+  if (error) return { ok: false, error: messageFor(error.message) };
+
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  if (user) {
+    await supabase
+      .from('profiles')
+      .update({ last_login_at: new Date().toISOString() })
+      .eq('id', user.id);
   }
 
-  createSession(user.id);
-  db.prepare('INSERT INTO activity_log (id, org_id, user_id, action, detail, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(
-    randomUUID(),
-    user.org_id,
-    user.id,
-    'Connexion',
-    `${user.full_name} s'est connecté`,
-    new Date().toISOString()
-  );
   return { ok: true };
 }
 
-export function register(input: {
+export async function register(input: {
   organizationName: string;
   fullName: string;
   email: string;
   password: string;
-}): AuthResult {
-  const db = getDb();
-  const email = input.email.trim().toLowerCase();
-  const organizationName = input.organizationName.trim();
-  const fullName = input.fullName.trim();
+}): Promise<AuthResult> {
+  const supabase = createServerSupabase();
 
-  if (!organizationName) return { ok: false, error: "Le nom de l'entreprise est requis." };
-  if (!fullName) return { ok: false, error: 'Votre nom complet est requis.' };
-  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return { ok: false, error: 'Adresse email invalide.' };
-  if (input.password.length < 8) return { ok: false, error: 'Le mot de passe doit contenir au moins 8 caractères.' };
+  // Le trigger `on_auth_user_created` crée l'organisation et le profil admin
+  // à partir de ces métadonnées.
+  const { error } = await supabase.auth.signUp({
+    email: input.email.trim().toLowerCase(),
+    password: input.password,
+    options: {
+      data: {
+        organization_name: input.organizationName.trim(),
+        full_name: input.fullName.trim(),
+      },
+    },
+  });
 
-  const existing = db.prepare('SELECT id FROM users WHERE lower(email) = lower(?)').get(email);
-  if (existing) return { ok: false, error: 'Un compte existe déjà avec cet email.' };
-
-  const slugBase =
-    organizationName
-      .toLowerCase()
-      .normalize('NFD')
-      .replace(/[\u0300-\u036f]/g, '')
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-+|-+$/g, '') || 'agence';
-
-  let slug = slugBase;
-  let n = 1;
-  while (db.prepare('SELECT id FROM organizations WHERE slug = ?').get(slug)) {
-    slug = `${slugBase}-${n++}`;
-  }
-
-  const orgId = randomUUID();
-  const userId = randomUUID();
-  const now = new Date().toISOString();
-
-  db.prepare(
-    `INSERT INTO organizations (id, name, slug, plan, status, address, email, phone, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(orgId, organizationName, slug, 'free', 'active', null, email, null, now);
-
-  db.prepare(
-    `INSERT INTO users (id, org_id, email, full_name, password_hash, role, enabled, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(userId, orgId, email, fullName, hashPassword(input.password), 'admin', 1, now);
-
-  db.prepare('INSERT INTO activity_log (id, org_id, user_id, action, detail, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(
-    randomUUID(),
-    orgId,
-    userId,
-    'Création de compte',
-    `Organisation « ${organizationName} » créée`,
-    now
-  );
-
-  createSession(userId);
+  if (error) return { ok: false, error: messageFor(error.message) };
   return { ok: true };
+}
+
+export async function logout(): Promise<void> {
+  const supabase = createServerSupabase();
+  await supabase.auth.signOut();
 }

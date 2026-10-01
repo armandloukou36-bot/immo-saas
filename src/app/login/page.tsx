@@ -6,8 +6,8 @@ import { ActionForm, SubmitButton } from '@/components/ui/ActionForm';
 
 export const metadata = { title: 'Connexion — IMMO SAAS' };
 
-export default function LoginPage() {
-  if (getSession()) redirect('/dashboard');
+export default async function LoginPage() {
+  if (await getSession()) redirect('/dashboard');
 
   return (
     <div className="min-h-screen bg-navy-50 flex items-center justify-center p-4">

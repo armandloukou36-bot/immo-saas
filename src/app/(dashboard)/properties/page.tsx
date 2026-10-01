@@ -1,16 +1,22 @@
 import { redirect } from 'next/navigation';
 import { getSession } from '@/lib/auth';
-import { all } from '@/lib/db';
+import { createServerSupabase } from '@/lib/supabase';
 import { PropertiesClient } from './PropertiesClient';
 import type { Property } from '@/lib/types';
 
 export const metadata = { title: 'Biens — IMMO SAAS' };
 
-export default function PropertiesPage() {
-  const user = getSession();
+export default async function PropertiesPage() {
+  const user = await getSession();
   if (!user) redirect('/login');
 
-  const properties = all<Property>('SELECT * FROM properties WHERE org_id = ? ORDER BY featured DESC, created_at DESC', user.org_id);
+  const supabase = createServerSupabase();
+  const { data } = await supabase
+    .from('properties')
+    .select('*')
+    .eq('organization_id', user.org_id)
+    .order('featured', { ascending: false })
+    .order('created_at', { ascending: false });
 
-  return <PropertiesClient properties={properties} />;
+  return <PropertiesClient properties={(data ?? []) as Property[]} />;
 }
